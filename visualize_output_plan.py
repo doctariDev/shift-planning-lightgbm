@@ -384,7 +384,7 @@ def write_index(pairs, out_dir):
         f.write("\n".join(lines))
     return out_path
 
-def main():
+def visualize_plans():
     ensure_dir(OUT_DIR)
     data = load_output(INPUT_JSON)
 
@@ -412,4 +412,4 @@ def main():
     print(f"Open: {idx}")
 
 if __name__ == "__main__":
-    main()
+    visualize_plans()

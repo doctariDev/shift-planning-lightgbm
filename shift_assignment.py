@@ -3,7 +3,7 @@ from typing import Optional
 
 import pandas as pd
 
-from transfer_plans import (
+from utils import (
     adapt_target_plan_to_frames,
     adapt_past_plans_to_frames,
     collect_history_stats,
@@ -16,14 +16,11 @@ from visualize_output_plan import ensure_dir, render_visualizations
 
 
 def run_pipeline(
-    job_json_path: str,
-    fairness_weekly_cap_hours: Optional[float] = None,  # kept for backward compatibility (maps to soft cap if provided)
+    planning_request_complete_path: str,
     visualization_mode: bool = False,
     output_dir: str = "viz_out",
-    fairness_weekly_soft_cap_hours: Optional[float] = 40.0,   # NEW preferred soft cap
-    fairness_opt_out_hard_cap_delta_hours: float = 10.0,       # NEW hard cap delta
 ):
-    with open(job_json_path, "r", encoding="utf-8") as f:
+    with open(planning_request_complete_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     # Historical
@@ -43,17 +40,10 @@ def run_pipeline(
     train_df = build_training_data(hist_shifts_df, assignments_df, users_df, stats_by_user_ctx, k_neg_per_pos=5)
     model, iso_cal, feats, (X_val, y_val) = train_and_calibrate_with_val(train_df)
 
-    # Map deprecated fairness_weekly_cap_hours -> soft cap if provided
-    soft_cap = fairness_weekly_soft_cap_hours
-    if fairness_weekly_cap_hours is not None:
-        soft_cap = fairness_weekly_cap_hours
-
-    # Assign target
+    # Assign target (caps are taken from employees' timed_properties inside assign_target_period)
     result, report = assign_target_period(
         target_shifts, users_by_id, shift_index,
-        model, iso_cal, feats, stats_by_user_ctx,            # FIX: use iso_cal and feats
-        fairness_weekly_soft_cap_hours=soft_cap,             # soft weekly (FTE-scaled)
-        fairness_opt_out_hard_cap_delta_hours=fairness_opt_out_hard_cap_delta_hours,  # hard cap = soft + delta
+        model, iso_cal, feats, stats_by_user_ctx,
         customer_tz=customer_tz,
         top_k=5
     )
@@ -91,12 +81,9 @@ def run_pipeline(
 
 if __name__ == "__main__":
     output = run_pipeline(
-        job_json_path="input_files/planning_request_complete_salzhofen.json",
-        fairness_weekly_cap_hours=50.0,  # interpreted as soft cap unless fairness_weekly_soft_cap_hours is set explicitly
+        planning_request_complete_path="input_files/check_public_holiday_pattern.json",
         visualization_mode=True,
         output_dir="output/viz_out",
-        fairness_weekly_soft_cap_hours=40.0,                 # optional explicit soft cap
-        fairness_opt_out_hard_cap_delta_hours=10.0,            # hard cap is soft + 10h
     )
     with open("output/output_job.json", "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
