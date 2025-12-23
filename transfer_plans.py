@@ -10,6 +10,8 @@ from sklearn.metrics import roc_auc_score, brier_score_loss, average_precision_s
 import lightgbm as lgb
 import warnings
 
+from visualize_output_plan import render_visualizations, ensure_dir
+
 warnings.filterwarnings("ignore")
 
 # =========================
@@ -21,15 +23,9 @@ except Exception:
     ZoneInfo = None
 
 def dt_parse_iso(s: str, tz: Optional[str]) -> datetime:
-    """
-    Parse ISO string with possible Z/offset; convert to customer tz if provided.
-    Returns timezone-aware datetime when tz is available and ZoneInfo is present,
-    otherwise a naive datetime.
-    """
     dt = pd.to_datetime(s)
     if tz and ZoneInfo:
         try:
-            # If dt has tzinfo (offset or Z), convert; else assume UTC then convert to tz
             if dt.tzinfo is None:
                 dt = dt.tz_localize("UTC")
             dt = dt.tz_convert(ZoneInfo(tz))
@@ -45,10 +41,6 @@ def dt_parse_iso(s: str, tz: Optional[str]) -> datetime:
 # =========================
 
 def parse_holiday_days(holiday_list: List[Dict[str, Any]]) -> set:
-    """
-    Build a set of holiday dates (YYYY-MM-DD) from public_holidays entries.
-    Only considers the 'date' field as the holiday day identifier.
-    """
     days = set()
     for h in holiday_list or []:
         dstr = h.get("date")
@@ -62,20 +54,11 @@ def parse_holiday_days(holiday_list: List[Dict[str, Any]]) -> set:
     return days
 
 def is_holiday_day(shift_start_dt: datetime, holiday_days: set) -> bool:
-    """
-    Returns True if the local date of shift_start_dt is in holiday_days.
-    Assumes shift_start_dt was already localized to customer tz if applicable.
-    """
     try:
         local_day = shift_start_dt.date()
         return local_day in holiday_days
     except Exception:
         return False
-
-# =========================
-# Visualization utilities
-# =========================
-
 
 # =========================
 # Core utilities
@@ -162,7 +145,7 @@ def positive_wishers(shift: Dict[str, Any]) -> List[str]:
     return []
 
 # =========================
-# Adapters: doctari JSON -> unified frames (holiday by day)
+# Adapters
 # =========================
 
 def adapt_past_plans_to_frames(data: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -241,16 +224,6 @@ def collect_history_stats(hist_shifts_df: pd.DataFrame,
                           assignments_df: pd.DataFrame,
                           users_df: pd.DataFrame,
                           lam: float = 0.85) -> Dict[str, Dict[Tuple, Dict[str, float]]]:
-    """
-    Build per-user, per-context recency-weighted stats, including holiday-only rates.
-    Context = (unit, shiftType, weekday).
-    For each (user, context):
-      - rw_assign_rate: overall recency-weighted assignment rate proxy
-      - rw_assign_rate_holiday: recency-weighted rate on holiday shifts only
-      - count_assigned / count_occurrences: totals
-      - count_assigned_holiday / count_occurrences_holiday: holiday-only totals
-      - last_assigned_days: recency marker (overall)
-    """
     if hist_shifts_df.empty:
         return {}
     df = hist_shifts_df.copy()
@@ -262,26 +235,19 @@ def collect_history_stats(hist_shifts_df: pd.DataFrame,
         "rw_denom": 0.0, "rw_num": 0.0,
         "count_occurrences": 0, "count_assigned": 0,
         "last_assigned_days": 9999.0,
-        # holiday-specific
         "rw_denom_holiday": 0.0, "rw_num_holiday": 0.0,
         "count_occurrences_holiday": 0, "count_assigned_holiday": 0
     }))
 
     df["context"] = df.apply(lambda r: (r["unit"], r["shiftType"], r["weekday"]), axis=1)
     context_by_shift = dict(zip(df["id"], df["context"]))
-    isHoliday_by_shift = dict(zip(df["id"], df["isHoliday"]))
 
     if assignments_df.empty:
-        # Compute occurrence counts without assignments if needed
         return stats
 
     merged = assignments_df.merge(df[["id", "unit", "shiftType", "weekday", "date", "isHoliday"]],
                                   left_on="shiftId", right_on="id", how="left")
     merged["date"] = pd.to_datetime(merged["date"])
-
-    # We also want to count occurrences per context for users we sample as negatives.
-    # For simplicity, we use assignment-driven stats plus recency/occurrence counters keyed off assignments.
-    # If you want full occurrence counts independent of assignments, extend with per-context shift frequencies.
 
     for _, row in merged.iterrows():
         uid = row["userId"]
@@ -296,14 +262,12 @@ def collect_history_stats(hist_shifts_df: pd.DataFrame,
         sh_is_hol = int(row.get("isHoliday", 0)) == 1
         s = stats[uid][ctx]
 
-        # overall
         s["rw_num"] += w
         s["rw_denom"] += w
         s["count_assigned"] += 1
-        s["count_occurrences"] += 1  # using assignments as occurrences proxy here
+        s["count_occurrences"] += 1
         s["last_assigned_days"] = min(s["last_assigned_days"], (now_dt - date_dt).days)
 
-        # holiday-only
         if sh_is_hol:
             s["rw_num_holiday"] += w
             s["rw_denom_holiday"] += w
@@ -471,25 +435,32 @@ def score_candidates_for_shift(shift: Dict[str, Any],
     X["shiftType"] = X["shiftType"].astype("category")
     p_raw = model.predict(X[features])
     p = iso_calibrator.predict(p_raw)
-    return list(zip(idx, p))  # do not sort here; we'll sort after blending
+    return list(zip(idx, p))
 
 def assign_target_period(target_shifts: List[Dict[str, Any]],
                          users_by_id: Dict[str, Dict[str, Any]],
                          shift_index: Dict[int, Dict[str, Any]],
                          model, iso_calibrator, features,
                          stats_by_user_ctx: Dict[str, Dict[Tuple, Dict[str, float]]],
-                         fairness_weekly_cap_hours: Optional[float] = None,
+                         fairness_weekly_soft_cap_hours: Optional[float] = None,   # optional global default; overridden by employee values
+                         fairness_opt_out_hard_cap_delta_hours: Optional[float] = None,  # optional global delta if max_weekly_hours missing
                          customer_tz: Optional[str] = None,
                          top_k: int = 5) -> Tuple[Dict[int, str], Dict[str, Any]]:
     assigned_by_user: Dict[str, List[int]] = defaultdict(list)
-    assigned_hours_by_user: Dict[str, float] = defaultdict(float)
+    assigned_hours_by_user_global: Dict[str, float] = defaultdict(float)
+    assigned_hours_by_user_week: Dict[Tuple[str, str], float] = defaultdict(float)
     all_assignments_by_user: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
     result = {}
     report = {
         "shifts": [],
         "usersSummary": {},
         "modelSummary": {},
-        "runConfig": {"fairness_weekly_cap_hours": fairness_weekly_cap_hours, "top_k": top_k}
+        "runConfig": {
+            "fairness_weekly_soft_cap_hours_default": fairness_weekly_soft_cap_hours,
+            "fairness_opt_out_hard_cap_delta_hours_default": fairness_opt_out_hard_cap_delta_hours,
+            "top_k": top_k
+        }
     }
 
     def shift_hours(s):
@@ -501,7 +472,24 @@ def assign_target_period(target_shifts: List[Dict[str, Any]],
         except Exception:
             return 8.0
 
-    # Process in chronological order
+    def week_key_from_date_str(dstr: str) -> str:
+        d = to_date(dstr)
+        y, w, _ = d.isocalendar()
+        return f"{y}-W{w:02d}"
+
+    def fairness_penalty(new_hours: float, soft_cap: Optional[float], hard_cap: Optional[float]) -> float:
+        if soft_cap is None or soft_cap <= 0:
+            return 0.0
+        if new_hours <= soft_cap:
+            proximity = new_hours / max(soft_cap, 1e-6)
+            return 0.05 * proximity
+        if hard_cap is not None and new_hours < hard_cap:
+            over = new_hours - soft_cap
+            span = max(hard_cap - soft_cap, 1e-6)
+            severity = min(over / span, 1.0)
+            return 0.20 + 0.30 * severity
+        return 1.0
+
     target_shifts = sorted(target_shifts, key=lambda x: (x["date"], x["start"]))
     for s in target_shifts:
         sid = s["id"]
@@ -524,7 +512,6 @@ def assign_target_period(target_shifts: List[Dict[str, Any]],
             "notes": []
         }
 
-        # Candidate generation
         explanation["decisionPath"].append("candidate_generation")
         all_user_ids = list(users_by_id.keys())
         for uid in all_user_ids:
@@ -549,15 +536,17 @@ def assign_target_period(target_shifts: List[Dict[str, Any]],
             report["shifts"].append(explanation)
             continue
 
-        # Scoring
         explanation["decisionPath"].append("scoring")
         ranked = score_candidates_for_shift(s, explanation["candidatesAfterFilters"], users_by_id, stats_by_user_ctx, model, iso_calibrator, features)
 
-        # Prepare stats for blending
+        if not ranked:
+            explanation["notes"].append("scoring produced no results")
+            report["shifts"].append(explanation)
+            continue
+
         ctx = (s["unit"], s["shiftType"], s["weekday"])
         stats_for_uid = {uid: (stats_by_user_ctx.get(uid, {}) or {}).get(ctx, {}) for uid, _ in ranked}
 
-        # Top-k details (report before blending)
         top_list_report = sorted(ranked, key=lambda t: t[1], reverse=True)[:top_k]
         enriched_top = []
         for uid, p in top_list_report:
@@ -575,16 +564,10 @@ def assign_target_period(target_shifts: List[Dict[str, Any]],
             })
         explanation["topCandidates"] = enriched_top
 
-        if not ranked:
-            explanation["notes"].append("scoring produced no results")
-            report["shifts"].append(explanation)
-            continue
-
-        # Blend score: p_cal + bonuses from history to break ties
-        beta1, beta2, beta3 = 0.10, 0.05, 0.05  # weights
-        C, L = 5.0, 60.0  # caps for count and recency window (days)
+        beta1, beta2, beta3 = 0.10, 0.05, 0.05
+        C, L = 5.0, 60.0
         is_holiday = int(s.get("isHoliday", 0)) == 1
-        holiday_weight = 0.08  # gentle extra nudge for holiday specialists; tune as needed
+        holiday_weight = 0.08
 
         def blended_score(uid: str, p: float) -> float:
             st = stats_for_uid.get(uid, {}) or {}
@@ -597,122 +580,78 @@ def assign_target_period(target_shifts: List[Dict[str, Any]],
             holiday_bonus = holiday_weight * rw_hol if is_holiday else 0.0
             return float(p) + beta1 * rw + beta2 * cnt_norm + beta3 * recency_bonus + holiday_bonus
 
-        ranked_blended = sorted(ranked, key=lambda t: blended_score(t[0], t[1]), reverse=True)
+        explanation["decisionPath"].append("greedy_pick_with_soft_fairness_and_employee_opt_out_cap")
 
-        # Greedy pick with fairness cap
-        explanation["decisionPath"].append("greedy_pick_with_fairness")
-        hrs = shift_hours(s)
-        chosen = None
-        chosen_p = None
-        fairness_skips = []
-        for uid, p in ranked_blended:
-            if fairness_weekly_cap_hours and assigned_hours_by_user[uid] + hrs > fairness_weekly_cap_hours:
-                fairness_skips.append({"userId": uid, "p": float(p), "reason": "fairness_cap"})
+        # Hours for this shift and week key
+        try:
+            hrs = (datetime.combine(to_date(s["date"]), parse_time_simple(s["end"])) -
+                   datetime.combine(to_date(s["date"]), parse_time_simple(s["start"]))).seconds / 3600.0
+        except Exception:
+            hrs = 8.0
+        wk = week_key_from_date_str(s["date"])
+
+        scored: List[Tuple[str, float, float, float, float]] = []
+        fairness_skips_hardcap = []
+
+        for uid, p in ranked:
+            urec = users_by_id.get(uid, {})
+            tp = (urec.get("timed_properties") or [{}])[0]
+            # Employee-specific soft and hard caps
+            soft_cap_uid = tp.get("weekly_hours", fairness_weekly_soft_cap_hours or 40.0)
+            hard_cap_uid = tp.get("max_weekly_hours", None)
+            # If hard cap missing, derive from soft + global delta if provided
+            if hard_cap_uid is None and fairness_opt_out_hard_cap_delta_hours is not None:
+                hard_cap_uid = soft_cap_uid + fairness_opt_out_hard_cap_delta_hours
+
+            current_week_hours = assigned_hours_by_user_week[(uid, wk)]
+            new_hours = current_week_hours + hrs
+
+            # Enforce hard cap (opt-out)
+            if hard_cap_uid is not None and new_hours > hard_cap_uid:
+                fairness_skips_hardcap.append({
+                    "userId": uid, "p": float(p), "reason": "opt_out_hard_cap", "week": wk,
+                    "current_week_hours": float(current_week_hours),
+                    "hard_cap_uid": float(hard_cap_uid)
+                })
                 continue
-            chosen = uid
-            chosen_p = float(p)
-            break
 
-        if chosen:
-            result[sid] = chosen
-            assigned_by_user[chosen].append(sid)
-            assigned_hours_by_user[chosen] += hrs
-            all_assignments_by_user[chosen].append(s)
-            explanation["chosen"] = {"userId": chosen, "p_calibrated": chosen_p}
-            if fairness_skips:
-                explanation["notes"].append({"fairness_skipped": fairness_skips})
-        else:
-            explanation["notes"].append("no candidate satisfied fairness cap")
+            base = blended_score(uid, p)
+            pen = fairness_penalty(new_hours, soft_cap_uid, hard_cap_uid)
+            scored.append((uid, base - pen, base, pen, float(new_hours)))
+
+        if not scored:
+            explanation["notes"].append("no candidate within employee opt-out hard cap")
+            if fairness_skips_hardcap:
+                explanation["notes"].append({"hard_cap_skipped": fairness_skips_hardcap})
+            report["shifts"].append(explanation)
+            continue
+
+        scored_sorted = sorted(scored, key=lambda t: t[1], reverse=True)
+        chosen, final_score, base_score, penalty_applied, final_week_hours = scored_sorted[0]
+
+        # Assign
+        result[sid] = chosen
+        assigned_by_user[chosen].append(sid)
+        assigned_hours_by_user_week[(chosen, wk)] += hrs
+        assigned_hours_by_user_global[chosen] += hrs
+        all_assignments_by_user[chosen].append(s)
+
+        explanation["chosen"] = {
+            "userId": chosen,
+            "score_after_penalty": float(final_score),
+            "base_score": float(base_score),
+            "fairness_penalty": float(penalty_applied),
+            "week_key": wk,
+            "week_hours_after": float(final_week_hours)
+        }
+        if fairness_skips_hardcap:
+            explanation["notes"].append({"hard_cap_skipped": fairness_skips_hardcap})
+
         report["shifts"].append(explanation)
 
     for uid in users_by_id.keys():
         report["usersSummary"][uid] = {
-            "totalHours": float(assigned_hours_by_user.get(uid, 0.0)),
+            "totalHours": float(assigned_hours_by_user_global.get(uid, 0.0)),
             "assignedCount": len(assigned_by_user.get(uid, []))
         }
     return result, report
-
-# =========================
-# Pipeline for doctari JSON
-# =========================
-
-def run_pipeline_on_doctari_json(job_json_path: str,
-                                 fairness_weekly_cap_hours: Optional[float] = None,
-                                 visualization_mode: bool = False,
-                                 output_dir: str = "viz_out"):
-    with open(job_json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # Historical
-    hist_shifts_df, assignments_df = adapt_past_plans_to_frames(data)
-    if hist_shifts_df.empty or assignments_df.empty:
-        raise ValueError("No historical data found. Ensure past_shift_plans contain shifts and shift_assignments.")
-
-    # Target
-    target_shifts, shift_index, users_by_id, customer_tz = adapt_target_plan_to_frames(data)
-    if not target_shifts:
-        raise ValueError("No target shifts found in shift_plan.shifts.")
-
-    users_df = pd.DataFrame(list(users_by_id.values()))
-
-    # Stats and training
-    stats_by_user_ctx = collect_history_stats(hist_shifts_df, assignments_df, users_df, lam=0.85)
-    train_df = build_training_data(hist_shifts_df, assignments_df, users_df, stats_by_user_ctx, k_neg_per_pos=5)
-    model, iso_cal, feats, (X_val, y_val) = train_and_calibrate_with_val(train_df)
-
-    # Assign target
-    result, report = assign_target_period(
-        target_shifts=target_shifts,
-        users_by_id=users_by_id,
-        shift_index=shift_index,
-        model=model,
-        iso_calibrator=iso_cal,
-        features=feats,
-        stats_by_user_ctx=stats_by_user_ctx,
-        fairness_weekly_cap_hours=fairness_weekly_cap_hours,
-        customer_tz=customer_tz,
-        top_k=5
-    )
-    report["modelSummary"] = {"featureImportance": get_feature_importance_dict(model, feats)}
-
-    print("Hist shifts:", hist_shifts_df.shape, "Assignments:", assignments_df.shape)
-    print("Distinct shiftIds with assignments:", assignments_df["shiftId"].nunique())
-    print("Missing shiftIds in history:", len(set(assignments_df["shiftId"]) - set(hist_shifts_df["id"])))
-    print(hist_shifts_df[["unit", "shiftType", "weekday"]].drop_duplicates().shape)
-
-    # Write back assignments into shift_plan.shift_assignments
-    target_shift_ids = {int(s["id"]) for s in data["shift_plan"].get("shifts", [])}
-    existing = data["shift_plan"].get("shift_assignments") or []
-    kept = [a for a in existing if int(a["shift_id"]) not in target_shift_ids]
-    for sid, uid in result.items():
-        kept.append({"shift_id": int(sid), "employee_uuid": uid, "source": "MODEL"})
-    data["shift_plan"]["shift_assignments"] = kept
-
-    # Visualization
-    if visualization_mode:
-        ensure_dir(output_dir)
-        viz = render_visualizations(model, iso_cal, feats, X_val, y_val, report,
-                                    target_shifts_count=len(target_shifts),
-                                    output_dir=output_dir, sample_topk_shifts=6)
-        data["reportHtml"] = viz["html"]
-        print(f"Visualization written to: {viz['html']}")
-
-    # Attach report
-    data["assignmentReport"] = report
-    return data
-
-# =========================
-# CLI
-# =========================
-
-if __name__ == "__main__":
-    output = run_pipeline_on_doctari_json(
-        job_json_path="input_files/generated_example_3.json",
-        fairness_weekly_cap_hours=40.0,
-        visualization_mode=True,
-        output_dir="viz_out"
-    )
-    with open("output_job.json", "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-    assigned_pairs = [(a["shift_id"], a["employee_uuid"]) for a in output["shift_plan"]["shift_assignments"] if a.get("source") == "MODEL"]
-    print(f"Assigned {len(assigned_pairs)} shifts by model, e.g.:", assigned_pairs[:10])

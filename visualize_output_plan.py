@@ -8,7 +8,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 from sklearn.metrics import precision_recall_curve, average_precision_score, roc_curve, auc
 
-INPUT_JSON = "input_files/output_job.json"
+INPUT_JSON = "output/output_job.json"
 OUT_DIR = "output/viz_calendar"
 DPI = 150
 
