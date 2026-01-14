@@ -162,6 +162,19 @@ def in_date_range(date_obj, start: Optional[str], end: Optional[str]) -> bool:
             return False
     return True
 
+# Week helpers for periodic features
+def iso_week_index_from_date(d: date_cls) -> int:
+    # stable increasing index: year*100 + week (ISO)
+    y, w, _ = d.isocalendar()
+    return int(y) * 100 + int(w)
+
+def rolling_weeks_freq(weeks_sorted: list[int], current_week_idx: int, window: int = 8) -> float:
+    if not weeks_sorted:
+        return 0.0
+    lo = current_week_idx - window
+    cnt = sum(1 for wk in weeks_sorted if lo <= wk < current_week_idx)
+    return cnt / float(window)
+
 # =========================
 # Feasibility checks (doctari schema)
 # =========================
@@ -287,13 +300,19 @@ def collect_history_stats(hist_shifts_df: pd.DataFrame,
     now = df["date"].max()
     now_dt = pd.to_datetime(now) if pd.notnull(now) else pd.Timestamp(datetime.utcnow())
 
-    stats = defaultdict(lambda: defaultdict(lambda: {
-        "rw_denom": 0.0, "rw_num": 0.0,
-        "count_occurrences": 0, "count_assigned": 0,
-        "last_assigned_days": 9999.0,
-        "rw_denom_holiday": 0.0, "rw_num_holiday": 0.0,
-        "count_occurrences_holiday": 0, "count_assigned_holiday": 0
-    }))
+    # default fields plus periodic store
+    def _init():
+        return {
+            "rw_denom": 0.0, "rw_num": 0.0,
+            "count_occurrences": 0, "count_assigned": 0,
+            "last_assigned_days": 9999.0,
+            "rw_denom_holiday": 0.0, "rw_num_holiday": 0.0,
+            "count_occurrences_holiday": 0, "count_assigned_holiday": 0,
+            # periodicity store
+            "weeks_worked": []  # sorted later
+        }
+
+    stats = defaultdict(lambda: defaultdict(_init))
 
     df["context"] = df.apply(lambda r: (r["unit"], r["shiftType"], r["weekday"]), axis=1)
     context_by_shift = dict(zip(df["id"], df["context"]))
@@ -324,16 +343,25 @@ def collect_history_stats(hist_shifts_df: pd.DataFrame,
         s["count_occurrences"] += 1
         s["last_assigned_days"] = min(s["last_assigned_days"], (now_dt - date_dt).days)
 
+        # store ISO week index for periodicity
+        wk_idx = iso_week_index_from_date(date_dt.date())
+        s["weeks_worked"].append(wk_idx)
+
         if sh_is_hol:
             s["rw_num_holiday"] += w
             s["rw_denom_holiday"] += w
             s["count_assigned_holiday"] += 1
             s["count_occurrences_holiday"] += 1
 
+    # finalize derived rates and sort the weeks list
     for uid, ctxs in stats.items():
         for ctx, s in ctxs.items():
             s["rw_assign_rate"] = (s["rw_num"] / max(s["rw_denom"], 1e-6))
-            s["rw_assign_rate_holiday"] = (s["rw_num_holiday"] / max(s["rw_denom_holiday"], 1e-6)) if s["rw_denom_holiday"] > 0 else 0.0
+            if s["rw_denom_holiday"] > 0:
+                s["rw_assign_rate_holiday"] = s["rw_num_holiday"] / max(s["rw_denom_holiday"], 1e-6)
+            else:
+                s["rw_assign_rate_holiday"] = 0.0
+            s["weeks_worked"] = sorted(set(s["weeks_worked"]))  # dedupe + sort
 
     return stats
 
@@ -352,6 +380,23 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
 
     rows = []
     rng = np.random.default_rng(42)
+
+    def periodic_feats(uid: str, ctx: tuple, cur_date_str: str) -> dict:
+        sstats = stats_by_user_ctx.get(uid, {}).get(ctx, {})
+        weeks = sstats.get("weeks_worked", []) or []
+        cur_week_idx = iso_week_index_from_date(to_date(cur_date_str))
+        prev_weeks = [w for w in weeks if w < cur_week_idx]
+        if prev_weeks:
+            last_w = prev_weeks[-1]
+            ws = cur_week_idx - last_w
+        else:
+            ws = 999.0
+        return {
+            "weeks_since_last_ctx_wd": float(ws),
+            "worked_last_1w_ctx_wd": 1.0 if ws == 1 else 0.0,
+            "worked_last_2w_ctx_wd": 1.0 if ws == 2 else 0.0,
+            "freq_ctx_wd_8w": rolling_weeks_freq(weeks, cur_week_idx, window=8)
+        }
 
     for sid, g in assignments_df.groupby("shiftId"):
         if sid not in shift_meta:
@@ -383,6 +428,7 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
         for uid in pos_users:
             sstats = stats_by_user_ctx.get(uid, {}).get(ctx, {})
             urec = users_by_id.get(uid, {})
+            pfeats = periodic_feats(uid, ctx, sm["date"])
             rows.append({
                 "shiftId": sid, "userId": uid, "y": 1,
                 "unit": sm["unit"], "shiftType": sm["shiftType"], "weekday": sm["weekday"],
@@ -390,7 +436,9 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
                 "rw_assign_rate": sstats.get("rw_assign_rate", 0.0),
                 "count_assigned": sstats.get("count_assigned", 0),
                 "last_assigned_days": sstats.get("last_assigned_days", 9999.0),
-                "userFTE": (urec.get("timed_properties", [{}])[0].get("weekly_hours", 40.0))/40.0
+                "userFTE": (urec.get("timed_properties", [{}])[0].get("weekly_hours", 40.0))/40.0,
+                # periodicity features
+                **pfeats
             })
         neg_pool = [u for u in compatible if u not in pos_users]
         if len(neg_pool) > 0:
@@ -399,6 +447,7 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
             for uid in neg_sample:
                 sstats = stats_by_user_ctx.get(uid, {}).get(ctx, {})
                 urec = users_by_id.get(uid, {})
+                pfeats = periodic_feats(uid, ctx, sm["date"])
                 rows.append({
                     "shiftId": sid, "userId": uid, "y": 0,
                     "unit": sm["unit"], "shiftType": sm["shiftType"], "weekday": sm["weekday"],
@@ -406,7 +455,9 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
                     "rw_assign_rate": sstats.get("rw_assign_rate", 0.0),
                     "count_assigned": sstats.get("count_assigned", 0),
                     "last_assigned_days": sstats.get("last_assigned_days", 9999.0),
-                    "userFTE": (urec.get("timed_properties", [{}])[0].get("weekly_hours", 40.0))/40.0
+                    "userFTE": (urec.get("timed_properties", [{}])[0].get("weekly_hours", 40.0))/40.0,
+                    # periodicity features
+                    **pfeats
                 })
 
     df = pd.DataFrame(rows)
@@ -421,8 +472,12 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
 # =========================
 
 def train_and_calibrate_with_val(df: pd.DataFrame) -> Tuple[Any, Any, List[str], Tuple[pd.DataFrame, pd.Series]]:
-    features = ["unit", "shiftType", "weekday", "hour", "duration", "isHoliday",
-                "rw_assign_rate", "count_assigned", "last_assigned_days", "userFTE"]
+    features = [
+        "unit", "shiftType", "weekday", "hour", "duration", "isHoliday",
+        "rw_assign_rate", "count_assigned", "last_assigned_days", "userFTE",
+        # periodicity features
+        "weeks_since_last_ctx_wd", "worked_last_1w_ctx_wd", "worked_last_2w_ctx_wd", "freq_ctx_wd_8w"
+    ]
     X = df[features]
     y = df["y"]
     cat_features = ["unit", "shiftType"]
@@ -471,17 +526,39 @@ def score_candidates_for_shift(shift: Dict[str, Any],
     except Exception:
         duration = 8.0
     isHoliday = int(shift.get("isHoliday", 0))
+
+    def periodic_feats_infer(uid: str, ctx: tuple, cur_date_str: str) -> dict:
+        sstats = stats_by_user_ctx.get(uid, {}).get(ctx, {})
+        weeks = sstats.get("weeks_worked", []) or []
+        cur_week_idx = iso_week_index_from_date(to_date(cur_date_str))
+        prev_weeks = [w for w in weeks if w < cur_week_idx]
+        if prev_weeks:
+            last_w = prev_weeks[-1]
+            ws = cur_week_idx - last_w
+        else:
+            ws = 999.0
+        return {
+            "weeks_since_last_ctx_wd": float(ws),
+            "worked_last_1w_ctx_wd": 1.0 if ws == 1 else 0.0,
+            "worked_last_2w_ctx_wd": 1.0 if ws == 2 else 0.0,
+            "freq_ctx_wd_8w": rolling_weeks_freq(weeks, cur_week_idx, window=8)
+        }
+
     rows, idx = [], []
+    cur_date_str = shift["date"]
     for uid in candidate_ids:
         s = stats_by_user_ctx.get(uid, {}).get(ctx, {})
         urec = users_by_id.get(uid, {})
+        pfeats = periodic_feats_infer(uid, ctx, cur_date_str)
         rows.append({
             "unit": shift["unit"], "shiftType": shift["shiftType"], "weekday": shift["weekday"],
             "hour": hour, "duration": duration, "isHoliday": isHoliday,
             "rw_assign_rate": s.get("rw_assign_rate", 0.0),
             "count_assigned": s.get("count_assigned", 0),
             "last_assigned_days": s.get("last_assigned_days", 9999.0),
-            "userFTE": (urec.get("timed_properties", [{}])[0].get("weekly_hours", 40.0))/40.0
+            "userFTE": (urec.get("timed_properties", [{}])[0].get("weekly_hours", 40.0))/40.0,
+            # periodicity features
+            **pfeats
         })
         idx.append(uid)
     if not rows:
@@ -563,7 +640,7 @@ def assign_target_period(target_shifts: List[Dict[str, Any]],
             "filteredOut": [],
             "candidatesAfterFilters": [],
             "topCandidates": [],
-            "candidatesAfterFinalScoreOnly": [],  # NEW: final scores list used for compact output
+            "candidatesAfterFinalScoreOnly": [],
             "chosen": None,
             "decisionPath": [],
             "notes": []
@@ -676,7 +753,6 @@ def assign_target_period(target_shifts: List[Dict[str, Any]],
             base = blended_score(uid, p)
             pen = fairness_penalty(new_hours, soft_cap_uid, hard_cap_uid)
             final = base - pen
-            # Keep only the final score for compact export
             explanation["candidatesAfterFinalScoreOnly"].append({
                 "userId": uid,
                 "final_score": float(final)
@@ -711,9 +787,7 @@ def assign_target_period(target_shifts: List[Dict[str, Any]],
         if fairness_skips_hardcap:
             explanation["notes"].append({"hard_cap_skipped": fairness_skips_hardcap})
 
-        # Sort candidates list by final_score desc for readability
         explanation["candidatesAfterFinalScoreOnly"].sort(key=lambda d: d["final_score"], reverse=True)
-
         report["shifts"].append(explanation)
 
     for uid in users_by_id.keys():
@@ -728,18 +802,107 @@ def assign_target_period(target_shifts: List[Dict[str, Any]],
 # =========================
 
 def build_assigned_output_final_only(report: dict) -> dict:
-
     shifts = []
     for s in report.get("shifts", []):
         cands = s.get("candidatesAfterFinalScoreOnly") or []
-        # normalize and sort by final_score desc
-        cands = [
-            {"userId": c["userId"], "final_score": float(c.get("final_score", 0.0))}
-            for c in cands
-        ]
+        cands = [{"userId": c["userId"], "final_score": float(c.get("final_score", 0.0))} for c in cands]
         cands.sort(key=lambda d: d["final_score"], reverse=True)
         shifts.append({
             "shiftId": int(s.get("shiftId")),
             "candidates": cands
         })
     return {"shifts": shifts}
+
+
+import json
+import os
+
+def assign_top_candidates_to_shifts(base_json_path: str,
+                                    model_output_path: str,
+                                    out_json_path: str,
+                                    source_label: str = "MODEL_TOP"):
+    """
+    Read base plan JSON and model output JSON, assign highest-scoring employee per shift,
+    and write a new JSON with updated 'shift_assignments'.
+    """
+    # Load inputs
+    with open(base_json_path, "r", encoding="utf-8") as f:
+        base = json.load(f)
+    with open(model_output_path, "r", encoding="utf-8") as f:
+        model = json.load(f)
+
+    sp = base.get("shift_plan", {}) or {}
+    base_assignments = sp.get("shift_assignments", []) or []
+
+    # Index existing assignments by shift_id for easy merge
+    existing_by_shift = {}
+    for a in base_assignments:
+        try:
+            sid = int(a.get("shift_id"))
+            existing_by_shift[sid] = {
+                "shift_id": sid,
+                "employee_uuid": a.get("employee_uuid"),
+                "source": a.get("source", "UNKNOWN"),
+            }
+        except (TypeError, ValueError):
+            continue
+
+    # Build top candidate assignment from model output
+    top_by_shift = {}
+    for entry in model.get("shifts", []) or []:
+        sid = entry.get("shiftId")
+        if sid is None:
+            continue
+        try:
+            sid_int = int(sid)
+        except (TypeError, ValueError):
+            continue
+
+        candidates = entry.get("candidates") or []
+        if not candidates:
+            continue
+
+        best = max(candidates, key=lambda c: c.get("final_score", float("-inf")))
+        user_id = best.get("userId")
+        if not user_id:
+            continue
+        top_by_shift[sid_int] = {
+            "shift_id": sid_int,
+            "employee_uuid": user_id,
+            "source": source_label
+        }
+
+    # Optional: filter model assignments to known shifts in base plan
+    known_shift_ids = set()
+    for sh in sp.get("shifts", []) or []:
+        try:
+            known_shift_ids.add(int(sh.get("id")))
+        except (TypeError, ValueError):
+            pass
+    filtered_top_by_shift = {}
+    for sid, a in top_by_shift.items():
+        if sid in known_shift_ids:
+            filtered_top_by_shift[sid] = a
+
+    # Merge policy:
+    # - If model provides a top assignment -> use it
+    # - Else -> keep existing assignment
+    merged_assignments_by_shift = dict(existing_by_shift)
+    for sid, a in filtered_top_by_shift.items():
+        merged_assignments_by_shift[sid] = a
+
+    # Build final shift_assignments list (stable order by shift_id ascending)
+    new_assignments = sorted(merged_assignments_by_shift.values(), key=lambda x: x["shift_id"])
+
+    # Write back into a copy of base JSON
+    out_base = dict(base)
+    out_sp = dict(sp)
+    out_sp["shift_assignments"] = new_assignments
+    out_base["shift_plan"] = out_sp
+
+    # Save
+    os.makedirs(os.path.dirname(out_json_path), exist_ok=True)
+    with open(out_json_path, "w", encoding="utf-8") as f:
+        json.dump(out_base, f, indent=2, ensure_ascii=False)
+
+    return out_json_path

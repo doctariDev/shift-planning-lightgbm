@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from datetime import datetime, timedelta, date
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 import pandas as pd
 import json
 import os
@@ -8,16 +8,14 @@ import numpy as np
 from matplotlib import pyplot as plt
 from sklearn.metrics import precision_recall_curve, average_precision_score, roc_curve, auc
 import shutil
-from pathlib import Path
-import base64
+import sys
 
+# Defaults (can be overridden via CLI)
 INPUT_JSON = "output/output_job.json"
-OUT_DIR = "output/calendar_visualization"
-DPI = 150
 
-# Extra output dirs to clean
-VIZ_OUT_DIR = "viz_out"
-CALENDER_OUT_DIR = "calender_out"  # keeping your spelling
+# Output dir for calendar images
+CALENDER_OUT_DIR = "calender_out"
+DPI = 300  # high resolution for readability
 
 # Colors
 EMP_COLORS = [
@@ -29,15 +27,12 @@ EMP_COLORS = [
 ]
 UNASSIGNED_COLOR = "#B0B0B0"
 HOLIDAY_BORDER_COLOR = "#800080"  # purple
+GRID_COLOR = "#DDDDDD"
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 def empty_dir(path: str):
-    """
-    Delete all files and subdirectories inside 'path' without deleting 'path' itself.
-    If the directory does not exist, it will be created.
-    """
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
         return
@@ -55,6 +50,8 @@ def save_fig(path: str):
     plt.tight_layout()
     plt.savefig(path, dpi=DPI)
     plt.close()
+
+# --- Model diagnostics (kept as-is to preserve render_visualizations) ---
 
 def plot_feature_importance(model, out_path: str, max_num_features=20):
     try:
@@ -135,7 +132,7 @@ def plot_topk_for_shift(shift_id: str, top_list: list, out_path: str, k: int = 5
 def _img_data_uri(path: str) -> str:
     if not path or not os.path.exists(path):
         return ""
-    suffix = Path(path).suffix.lower()
+    suffix = os.path.splitext(path)[1].lower()
     mime = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -145,48 +142,15 @@ def _img_data_uri(path: str) -> str:
         ".webp": "image/webp",
     }.get(suffix, "application/octet-stream")
     with open(path, "rb") as f:
+        import base64
         b64 = base64.b64encode(f.read()).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
 def write_html_report(out_dir: str, run_title: str, summary: dict, images: dict, assignment_report_path: str):
-    html = []
-    html.append(f"<html><head><meta charset='utf-8'><title>{run_title}</title></head><body>")
-    html.append(f"<h1>{run_title}</h1>")
-    html.append("<h2>Run Summary</h2>")
-    html.append("<ul>")
-    html.append(f"<li>Total shifts (target): {summary.get('target_shifts_total')}</li>")
-    html.append(f"<li>Assigned shifts: {summary.get('assigned_shifts')}</li>")
-    html.append(f"<li>Unassigned shifts: {summary.get('unassigned_shifts')}</li>")
-    html.append(f"<li>Users with assignments: {summary.get('users_with_assignments')}</li>")
-    html.append("</ul>")
-    # Keep JSON as a file link; will work in a browser even if Jupyter blocks file://
-    html.append(f"<p>Assignment report JSON: <a href='{os.path.basename(assignment_report_path)}'>{os.path.basename(assignment_report_path)}</a></p>")
-
-    def img_tag(path, title):
-        if not path or not os.path.exists(path):
-            return ""
-        data_uri = _img_data_uri(path)
-        return f"<div><h3>{title}</h3><img src='{data_uri}' style='max-width:900px;'/></div>"
-
-    html.append("<h2>Model Diagnostics</h2>")
-    html.append(img_tag(images.get("feat_importance"), "Feature Importance (gain)"))
-    html.append(img_tag(images.get("calibration"), "Calibration curve"))
-    html.append(img_tag(images.get("pr"), "Precision–Recall"))
-    html.append(img_tag(images.get("roc"), "ROC"))
-
-    html.append("<h2>Plan Insights</h2>")
-    html.append(img_tag(images.get("workload"), "Workload distribution (hours per user)"))
-    topk_imgs = images.get("topk", [])
-    if topk_imgs:
-        html.append("<h2>Top‑k leaderboards (sampled shifts)</h2>")
-        for p in topk_imgs:
-            title = f"Top‑k: {os.path.splitext(os.path.basename(p))[0]}"
-            html.append(img_tag(p, title))
-
-    html.append("</body></html>")
+    # Minimal stub to keep render_visualizations unchanged
     out_path = os.path.join(out_dir, "report.html")
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(html))
+        f.write(f"<html><body><h1>{run_title}</h1></body></html>")
     return out_path
 
 def render_visualizations(model, iso_cal, feats, X_val, y_val, report, target_shifts_count, output_dir: str, sample_topk_shifts: int = 5):
@@ -224,14 +188,13 @@ def render_visualizations(model, iso_cal, feats, X_val, y_val, report, target_sh
                                   images=images, assignment_report_path=assignment_report_path)
     return {"images": images, "html": html_path, "summary": summary}
 
+# --- Helpers for timeline rendering ---
+
 def to_dt(s: str) -> datetime:
     return pd.to_datetime(s).to_pydatetime()
 
 def fmt_hm(dt: datetime) -> str:
     return dt.strftime("%H:%M")
-
-def month_key(d: date) -> str:
-    return d.strftime("%Y-%m")
 
 def daterange(start_date: date, end_date: date):
     cur = start_date
@@ -239,18 +202,11 @@ def daterange(start_date: date, end_date: date):
         yield cur
         cur += timedelta(days=1)
 
-def first_day_of_month(d: date) -> date:
-    return date(d.year, d.month, 1)
-
-def last_day_of_month(d: date) -> date:
-    nd = date(d.year + d.month // 12, d.month % 12 + 1, 1)
-    return nd - timedelta(days=1)
-
 def build_employee_maps(employees):
     id2name = {}
     for e in employees:
-        id2name[e["uuid"]] = e.get("name") or e["uuid"]
-    # stable color per employee
+        full = f"{e.get('first_name','').strip()} {e.get('last_name','').strip()}".strip()
+        id2name[e["uuid"]] = full if full else e["uuid"]
     emp_ids = sorted(id2name.keys())
     id2color = {uid: EMP_COLORS[i % len(EMP_COLORS)] for i, uid in enumerate(emp_ids)}
     id2color[None] = UNASSIGNED_COLOR
@@ -260,243 +216,367 @@ def load_output(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def build_shift_records(shifts, assignments, id2name):
-    """
-    Build a DataFrame with shift records used for visualization.
-    No holiday propagation here; holidays are read directly from JSON public_holidays.
-    """
-    # index assignments by shift_id
-    asg_by_shift = {}
-    for a in assignments or []:
-        sid = int(a["shift_id"])
-        asg_by_shift[sid] = {
-            "employee_uuid": a["employee_uuid"],
-            "source": a.get("source")
-        }
+def build_workplace_name_map(shift_plan: dict, past_shift_plans: list):
+    id2wp = {}
+    for wp in (shift_plan.get("workplaces") or []):
+        id2wp[int(wp["id"])] = wp.get("name") or f"Workplace {wp['id']}"
+    for plan in past_shift_plans or []:
+        for wp in (plan.get("workplaces") or []):
+            id2wp[int(wp["id"])] = wp.get("name") or f"Workplace {wp['id']}"
+    return id2wp
+
+def build_shift_records(shifts, assignments, id2name, id2wpname):
+    asg_by_shift = {int(a["shift_id"]): a for a in (assignments or [])}
     rows = []
     for sh in shifts or []:
         sid = int(sh["id"])
         start = to_dt(sh["start_date_time"])
         end = to_dt(sh["end_date_time"])
+        wp_id = int(sh.get("workplace_id")) if sh.get("workplace_id") is not None else None
         asg = asg_by_shift.get(sid, {})
         emp = asg.get("employee_uuid")
         rows.append({
             "shift_id": sid,
-            "unit": str(sh.get("workplace_id")),
+            "workplace_id": wp_id,
+            "workplace_name": id2wpname.get(wp_id, f"Workplace {wp_id}") if wp_id is not None else "Unknown",
             "shiftType": str(sh.get("shift_card_id") or "GEN"),
             "start": start,
             "end": end,
             "date": start.date(),
-            "weekday": start.weekday(),  # Monday=0
+            "weekday": start.weekday(),
             "assigned": emp is not None,
             "employee_uuid": emp,
             "employee_name": id2name.get(emp, "Unassigned")
         })
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values(["start", "unit"]).reset_index(drop=True)
+        # Derive last name for label
+        def last_name(full: str) -> str:
+            if not full or full == "Unassigned":
+                return "Unassigned"
+            parts = full.strip().split()
+            return parts[-1] if parts else full
+        df["employee_last_name"] = df["employee_name"].apply(last_name)
+        df = df.sort_values(["date", "workplace_name", "start"]).reset_index(drop=True)
     return df
 
-def group_by_month(df):
-    # returns OrderedDict of {YYYY-MM: df_month}
-    if df.empty:
-        return OrderedDict()
-    df = df.copy()
-    df["month"] = df["date"].apply(month_key)
-    keys = sorted(df["month"].unique())
-    return OrderedDict((k, df[df["month"] == k].copy()) for k in keys)
-
-def month_calendar_grid(dt_month: date):
-    # Build a 6x7 grid covering the month with Monday as first column (0)
-    first = first_day_of_month(dt_month)
-    last = last_day_of_month(dt_month)
-    # start from Monday on/before first
-    start = first - timedelta(days=(first.weekday() - 0) % 7)
-    # end at Sunday on/after last
-    end = last + timedelta(days=(6 - last.weekday()) % 7)
-    # ensure 6 weeks displayed
-    days = list(daterange(start, end))
-    while len(days) < 42:
-        end += timedelta(days=7)
-        days = list(daterange(start, end))
-    return days[:42], start, end
-
-def draw_month_calendar(ax, month_date: date, day_to_items, id2color, title, holidays_set=None):
-    """
-    Draws a month calendar. If holidays_set contains a date, that day's cell gets a purple border.
-    """
-    holidays_set = holidays_set or set()
-
-    ax.axis("off")
-    days, grid_start, grid_end = month_calendar_grid(month_date)
-    rows, cols = 6, 7
-
-    # Base grid (light gray)
-    for r in range(rows):
-        for c in range(cols):
-            ax.add_patch(plt.Rectangle((c, rows-1-r), 1, 1, fill=False, edgecolor="#999999", linewidth=1.0))
-
-    # Weekday headers
-    weekdays = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    for c, wd in enumerate(weekdays):
-        ax.text(c+0.02, rows+0.2, wd, fontsize=10, ha="left", va="bottom", transform=ax.transData)
-
-    # Month title
-    ax.text(0, rows+0.6, title, fontsize=14, weight="bold", ha="left", va="bottom", transform=ax.transData)
-
-    # Cells
-    for idx, d in enumerate(days):
-        r = idx // cols
-        c = idx % cols
-        x0, y0 = c, rows-1-r
-
-        # Overlay purple border for holidays
-        if d in holidays_set:
-            ax.add_patch(plt.Rectangle((x0, y0), 1, 1, fill=False, edgecolor=HOLIDAY_BORDER_COLOR, linewidth=2.0))
-
-        # Day number
-        in_month = (d.month == month_date.month and d.year == month_date.year)
-        day_color = "black" if in_month else "#AAAAAA"
-        ax.text(x0+0.03, y0+0.85, str(d.day), fontsize=9, color=day_color, ha="left", va="top", transform=ax.transData)
-
-        items = day_to_items.get(d, [])
-        if not items:
-            continue
-
-        # Sort items by start time
-        items = sorted(items, key=lambda it: it["start"])
-        usable_height = 0.80
-        max_blocks = max(1, len(items))
-        block_h = min(0.18, usable_height / max_blocks)
-        y_cursor = y0 + 0.80 - block_h
-
-        for it in items:
-            color = id2color.get(it["employee_uuid"], id2color[None])
-            ax.add_patch(plt.Rectangle((x0+0.02, y_cursor), 0.96, block_h, color=color, alpha=0.9, ec="black", lw=0.3))
-            label = f"{it['shiftType']} · U{it['unit']} · {fmt_hm(it['start'])}-{fmt_hm(it['end'])}"
-            if it["assigned"]:
-                label += f" · {it['employee_name']}"
-            else:
-                label += " · Unassigned"
-            ax.text(x0+0.04, y_cursor + block_h/2, label, fontsize=7, color="white",
-                    ha="left", va="center", transform=ax.transData)
-            y_cursor -= (block_h + 0.01)
-
-    ax.set_xlim(0, cols)
-    ax.set_ylim(0, rows+1)
-
-def build_day_map(df):
-    # Group items by date
-    day_map = defaultdict(list)
-    for _, row in df.iterrows():
-        item = {
-            "unit": row["unit"],
-            "shiftType": row["shiftType"],
-            "start": row["start"],
-            "end": row["end"],
-            "assigned": bool(row["assigned"]),
-            "employee_uuid": row.get("employee_uuid"),
-            "employee_name": row.get("employee_name", "Unassigned")
-        }
-        day_map[row["date"]].append(item)
-    return day_map
-
 def parse_holiday_days(holiday_list):
-    """
-    From JSON 'public_holidays' entries, parse and return a set of Python date objects.
-    """
     days = set()
     for h in holiday_list or []:
-        dstr = h.get("date")
-        if not dstr:
-            # Some feeds might not have 'date' but have 'start'/'end'; fallback to 'start'
-            dstr = h.get("start")
+        dstr = h.get("date") or h.get("start")
         if not dstr:
             continue
         try:
-            day = pd.to_datetime(dstr).date()
-            days.add(day)
+            days.add(pd.to_datetime(dstr).date())
         except Exception:
             continue
     return days
 
-def render_calendars_for_plan(plan_name, df, id2color, out_dir, holidays_set=None):
+# Layout helper with explicit top/bottom row padding
+def compute_row_layout(df: pd.DataFrame, start_date: date, end_date: date,
+                       cell_height_px: int = 110,
+                       row_padding_top_px: int = 36,
+                       row_padding_bottom_px: int = 36,
+                       min_block_h_px: int = 40,
+                       max_days: int = 31):
+    # Build days
+    all_days = list(daterange(start_date, end_date))
+    if len(all_days) > max_days:
+        all_days = all_days[:max_days]
+    day_index = {d: i for i, d in enumerate(all_days)}
+    cols = len(all_days)
+
+    workplaces = sorted(df["workplace_name"].dropna().unique().tolist())
+
+    grouped = defaultdict(list)
+    for _, row in df.iterrows():
+        d = row["date"]
+        w = row["workplace_name"]
+        if d in day_index and w in workplaces:
+            grouped[(d, w)].append(row)
+
+    # Compute per-workplace row height from busiest day stacks
+    row_heights_px = {}
+    for w in workplaces:
+        max_stack = 1
+        for d in all_days:
+            n = len(grouped.get((d, w), []))
+            max_stack = max(max_stack, n)
+        # Ensure sufficient space even if we need to enforce a minimum block height
+        needed_blocks_h = max_stack * max(cell_height_px, min_block_h_px)
+        row_heights_px[w] = needed_blocks_h + row_padding_top_px + row_padding_bottom_px
+
+    return {
+        "workplaces": workplaces,
+        "day_index": day_index,
+        "cols": cols,
+        "grouped": grouped,
+        "row_heights_px": row_heights_px,
+        "all_days": all_days,
+        "row_padding_top_px": row_padding_top_px,
+        "row_padding_bottom_px": row_padding_bottom_px,
+        "cell_height_px": cell_height_px,
+        "min_block_h_px": min_block_h_px
+    }
+
+# --- Timeline visualization ---
+
+def draw_timeline_calendar(ax, start_date: date, end_date: date, df: pd.DataFrame,
+                           id2color: dict, title: str, holidays_set=None, max_days: int = 31,
+                           font_day: int = 12, font_label: int = 11,
+                           cell_height_px: int = 110,
+                           row_padding_top_px: int = 36,
+                           row_padding_bottom_px: int = 36,
+                           min_block_h_px: int = 40,
+                           dpi: int = DPI):
+    holidays_set = holidays_set or set()
+
+    layout = compute_row_layout(df, start_date, end_date,
+                                cell_height_px=cell_height_px,
+                                row_padding_top_px=row_padding_top_px,
+                                row_padding_bottom_px=row_padding_bottom_px,
+                                min_block_h_px=min_block_h_px,
+                                max_days=max_days)
+    workplaces = layout["workplaces"]
+    day_index = layout["day_index"]
+    cols = layout["cols"]
+    grouped = layout["grouped"]
+    row_heights_px = layout["row_heights_px"]
+
+    if not workplaces or cols == 0:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No shifts", ha="center", va="center")
+        return
+
+    total_height_px = sum(row_heights_px[w] for w in workplaces)
+
+    # Map workplace to bottom Y (in pixels)
+    y_bottom = {}
+    cur_y = 0
+    for w in reversed(workplaces):  # top row last
+        y_bottom[w] = cur_y
+        cur_y += row_heights_px[w]
+
+    ax.set_xlim(0, cols)
+    ax.set_ylim(0, total_height_px)
+    ax.axis("off")
+
+    # Title and day headers
+    ax.text(0, total_height_px + 0.06 * total_height_px, title, fontsize=14, weight="bold",
+            ha="left", va="bottom", transform=ax.transData)
+    for d, x in day_index.items():
+        ax.text(x + 0.5, total_height_px + 0.03 * total_height_px, f"{d.day}",
+                fontsize=font_day, ha="center", va="bottom", transform=ax.transData)
+        if d in holidays_set:
+            ax.plot([x, x+1], [total_height_px, total_height_px], color=HOLIDAY_BORDER_COLOR, linewidth=3)
+
+    # Vertical grid lines
+    for c in range(cols + 1):
+        ax.plot([c, c], [0, total_height_px], color=GRID_COLOR, linewidth=0.8)
+
+    # Workplace separators and labels
+    for w in workplaces:
+        y0 = y_bottom[w]
+        h_px = row_heights_px[w]
+        ax.plot([0, cols], [y0, y0], color=GRID_COLOR, linewidth=0.8)
+        ax.text(-0.1, y0 + h_px/2, w, fontsize=font_day, ha="right", va="center", transform=ax.transData)
+
+    # Horizontal padding per day column (fraction of width)
+    pad_x = 0.10
+
+    # Draw shift blocks using top/bottom paddings to keep rows separated
+    for (d, w), items in grouped.items():
+        x = day_index[d]
+        y0 = y_bottom[w]
+        h_px = row_heights_px[w]
+        usable_h_px = max(1, h_px - (row_padding_top_px + row_padding_bottom_px))
+        n = max(1, len(items))
+
+        # Each block height is nominal cell_height_px, but we never go below min_block_h_px
+        nominal = cell_height_px
+        block_h_px = max(min_block_h_px, min(nominal, usable_h_px / n))
+
+        # Start from the top of row minus top padding
+        y_cursor = y0 + h_px - row_padding_top_px - block_h_px
+
+        # Sort by start time
+        items = sorted(items, key=lambda r: r["start"])
+        for it in items:
+            color = id2color.get(it["employee_uuid"], UNASSIGNED_COLOR)
+
+            rect_x = x + pad_x
+            rect_w = 1 - 2 * pad_x
+            rect_y = max(y0 + row_padding_bottom_px, y_cursor)  # clamp to bottom padding
+            rect_h = block_h_px
+
+            # Ensure we don't draw into top padding either
+            top_limit = y0 + h_px - row_padding_top_px
+            if rect_y + rect_h > top_limit:
+                rect_h = max(min_block_h_px, top_limit - rect_y)
+
+            ax.add_patch(plt.Rectangle((rect_x, rect_y),
+                                       rect_w, rect_h,
+                                       color=color, alpha=0.95, ec="black", lw=0.3))
+
+            # Two-line label
+            time_part = f"{fmt_hm(it['start'])}-{fmt_hm(it['end'])}"
+            name_part = it["employee_last_name"] if it["assigned"] else "Unassigned"
+            fsize = font_label if n <= 2 else max(9, font_label - 1)
+
+            text_x = rect_x + 0.02
+            text_y_center = rect_y + rect_h / 2.0
+            line_spacing_px = max(6, rect_h * 0.28)  # a bit more spacing
+
+            # First line: time
+            ax.text(text_x, text_y_center + line_spacing_px/2,
+                    time_part, fontsize=fsize, color="white",
+                    ha="left", va="center", transform=ax.transData)
+
+            # Second line: last name
+            ax.text(text_x, text_y_center - line_spacing_px/2,
+                    name_part, fontsize=fsize, color="white",
+                    ha="left", va="center", transform=ax.transData)
+
+            # Move down for next block with larger gap
+            y_cursor -= (rect_h + 10)  # 10 px gap between blocks
+
+# Render pages; width and height based on content
+def render_timeline_for_plan(plan_name: str, df: pd.DataFrame, planning_period: dict,
+                             id2color: dict, out_dir: str, holidays_set=None, max_days: int = 31,
+                             per_day_inch: float = 2.0,
+                             cell_height_px: int = 110,
+                             row_padding_top_px: int = 36,
+                             row_padding_bottom_px: int = 36,
+                             min_block_h_px: int = 40):
     if df.empty:
         return []
     holidays_set = holidays_set or set()
-    months = group_by_month(df)
-    outputs = []
-    for mk, mdf in months.items():
-        year, mon = map(int, mk.split("-"))
-        month_date = date(year, mon, 1)
-        day_map = build_day_map(mdf)
 
-        fig, ax = plt.subplots(1, 1, figsize=(14, 10))
-        draw_month_calendar(ax, month_date, day_map, id2color,
-                            title=f"{plan_name} – {month_date.strftime('%B %Y')}",
-                            holidays_set=holidays_set)
-        fname = f"{plan_name.replace(' ', '_').lower()}_{mk}.png"
+    start = pd.to_datetime(planning_period.get("start_date")).date() if planning_period else df["date"].min()
+    end = pd.to_datetime(planning_period.get("end_date")).date() if planning_period else df["date"].max()
+
+    outputs = []
+    cur = start
+    while cur <= end:
+        page_end = min(end, cur + timedelta(days=max_days - 1))
+        all_days = list(daterange(cur, page_end))
+        if len(all_days) > max_days:
+            all_days = all_days[:max_days]
+        days_on_page = len(all_days)
+
+        # Width by days
+        fig_w = max(18, per_day_inch * days_on_page)
+
+        # Height by sum of per-row requirements
+        layout = compute_row_layout(df, cur, page_end,
+                                    cell_height_px=cell_height_px,
+                                    row_padding_top_px=row_padding_top_px,
+                                    row_padding_bottom_px=row_padding_bottom_px,
+                                    min_block_h_px=min_block_h_px,
+                                    max_days=max_days)
+        total_height_px = sum(layout["row_heights_px"][w] for w in layout["workplaces"])
+        fig_h = max(6, total_height_px / DPI + 1.8)  # +headroom
+
+        fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h))
+        title = f"{plan_name} – {cur.strftime('%Y-%m-%d')} to {page_end.strftime('%Y-%m-%d')}"
+        draw_timeline_calendar(ax, cur, page_end, df, id2color, title,
+                               holidays_set=holidays_set, max_days=max_days,
+                               font_day=13, font_label=12,
+                               cell_height_px=cell_height_px,
+                               row_padding_top_px=row_padding_top_px,
+                               row_padding_bottom_px=row_padding_bottom_px,
+                               min_block_h_px=min_block_h_px,
+                               dpi=DPI)
+        fname = f"{plan_name.replace(' ', '_').lower()}_{cur.strftime('%Y%m%d')}_{page_end.strftime('%Y%m%d')}.png"
         out_path = os.path.join(out_dir, fname)
         plt.tight_layout()
         plt.savefig(out_path, dpi=DPI)
         plt.close(fig)
-        outputs.append((f"{plan_name} {month_date.strftime('%B %Y')}", out_path))
+        outputs.append(out_path)
+        cur = page_end + timedelta(days=1)
+
     return outputs
 
-def write_index(pairs, out_dir):
-    # Include <base> here so the links work if served via HTTP
-    base_href = Path(out_dir).resolve().as_uri().rstrip("/") + "/"
-    lines = []
-    lines.append("<html><head><meta charset='utf-8'>"
-                 f"<base href='{base_href}'>"
-                 "<title>Shift Calendars</title></head><body>")
-    lines.append("<h1>Shift Calendars</h1>")
-    lines.append("<ul>")
-    for title, path in pairs:
-        lines.append(f"<li><a href='{os.path.basename(path)}'>{title}</a></li>")
-    lines.append("</ul>")
-    lines.append("</body></html>")
-    out_path = os.path.join(out_dir, "index.html")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    return out_path
+# --- Main workflow ---
 
-def visualize_plans():
-    ensure_dir(OUT_DIR)
+def visualize_plans(json_path: str = None):
+    # Resolve JSON path
+    if json_path is None:
+        json_path = INPUT_JSON
+    if not isinstance(json_path, (str, os.PathLike)):
+        raise TypeError("visualize_plans expects a file path string; got a different type.")
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"JSON file does not exist: {json_path}")
 
-    # Clean the requested folders before generating new visualizations
-    empty_dir(VIZ_OUT_DIR)
+    # Prepare output dir
+    ensure_dir(CALENDER_OUT_DIR)
     empty_dir(CALENDER_OUT_DIR)
 
-    data = load_output(INPUT_JSON)
+    # Load data
+    data = load_output(json_path)
 
-    # Target plan
+    # Maps
     sp = data.get("shift_plan", {}) or {}
+    past = data.get("past_shift_plans", []) or []
     employees = sp.get("employees", []) or []
     id2name, id2color = build_employee_maps(employees)
+    id2wpname = build_workplace_name_map(sp, past)
 
-    # Build target DF
-    target_df = build_shift_records(sp.get("shifts", []) or [], sp.get("shift_assignments", []) or [], id2name)
-
-    # Holidays from target plan JSON
+    # Target DF and holidays
+    target_df = build_shift_records(
+        sp.get("shifts", []) or [],
+        sp.get("shift_assignments", []) or [],
+        id2name, id2wpname
+    )
     target_holidays = parse_holiday_days(sp.get("public_holidays") or [])
+    target_period = sp.get("planning_period") or {}
 
-    # Past plans (each rendered separately with their own holidays)
-    past = data.get("past_shift_plans", []) or []
-    past_outputs = []
+    if target_df.empty:
+        print("Warning: Target plan has no shifts to render.")
+
+    # Past plans
+    generated_files = []
     for i, plan in enumerate(past):
         plan_label = f"Past Plan {plan.get('id', i+1)}"
-        hist_df = build_shift_records(plan.get("shifts", []) or [], plan.get("shift_assignments", []) or [], id2name)
+        hist_df = build_shift_records(
+            plan.get("shifts", []) or [],
+            plan.get("shift_assignments", []) or [],
+            id2name, id2wpname
+        )
         plan_holidays = parse_holiday_days(plan.get("public_holidays") or [])
-        past_outputs += render_calendars_for_plan(plan_label, hist_df, id2color, OUT_DIR, holidays_set=plan_holidays)
+        plan_period = plan.get("planning_period") or {}
+        if hist_df.empty:
+            print(f"Info: {plan_label} has no shifts.")
+        else:
+            generated_files += render_timeline_for_plan(
+                plan_label, hist_df, plan_period, id2color,
+                CALENDER_OUT_DIR, holidays_set=plan_holidays, max_days=31,
+                per_day_inch=2.2,
+                cell_height_px=110,
+                row_padding_top_px=36,
+                row_padding_bottom_px=36,
+                min_block_h_px=48
+            )
 
-    # Target calendars by month (with target holidays)
-    target_outputs = render_calendars_for_plan("Target Plan", target_df, id2color, OUT_DIR, holidays_set=target_holidays)
+    # Target plan timeline
+    generated_files += render_timeline_for_plan(
+        "Target Plan", target_df, target_period, id2color,
+        CALENDER_OUT_DIR, holidays_set=target_holidays, max_days=31,
+        per_day_inch=2.2,
+        cell_height_px=110,
+        row_padding_top_px=36,
+        row_padding_bottom_px=36,
+        min_block_h_px=48
+    )
 
-    all_outputs = target_outputs + past_outputs
-    idx = write_index(all_outputs, OUT_DIR)
-    print(f"Rendered {len(all_outputs)} calendar images.")
-    print(f"Open: {idx}")
+    if not generated_files:
+        print("No timeline images were generated (no shifts in any plan).")
+    else:
+        print("Generated images:")
+        for p in generated_files:
+            print(f" - {p}")
 
 if __name__ == "__main__":
-    visualize_plans()
+    # CLI: python script.py path/to.json
+    json_path = sys.argv[1] if len(sys.argv) > 1 else None
+    visualize_plans(json_path)
