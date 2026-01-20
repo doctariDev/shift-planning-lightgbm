@@ -4,6 +4,7 @@ import pandas as pd
 from utils import (
     adapt_target_plan_to_frames,
     adapt_past_plans_to_frames,
+    build_assigned_output,
     collect_history_stats,
     build_training_data,
     train_and_calibrate_with_val,
@@ -35,7 +36,7 @@ def build_assignment_output(report: dict) -> dict:
 
 def run_pipeline(
     planning_request_complete_path: str,
-    output_dir: str = "output/output_job.json",
+    output_dir: str = "output",
 ):
     with open(planning_request_complete_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -77,7 +78,7 @@ def run_pipeline(
 
     data["assignmentReport"] = report
 
-    compact = build_assignment_output(report)
+    compact = build_assigned_output(report)
 
     ensure_dir("output")
     with open(output_dir, "w", encoding="utf-8") as f:
