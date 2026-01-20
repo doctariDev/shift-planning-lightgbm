@@ -1,14 +1,18 @@
 import json
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime, date as date_cls, time as time_cls
+import os
+import warnings
+from collections import defaultdict
+from datetime import date as date_cls
+from datetime import datetime
+from datetime import time as time_cls
+from typing import Any
+
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from collections import defaultdict
-from sklearn.model_selection import train_test_split
 from sklearn.isotonic import IsotonicRegression
-from sklearn.metrics import roc_auc_score, brier_score_loss, average_precision_score
-import lightgbm as lgb
-import warnings
+from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
+from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
@@ -20,7 +24,7 @@ try:
 except Exception:
     ZoneInfo = None
 
-def dt_parse_iso(s: str, tz: Optional[str]) -> datetime:
+def dt_parse_iso(s: str, tz: str | None) -> datetime:
     dt = pd.to_datetime(s)
     if tz and ZoneInfo:
         try:
@@ -38,7 +42,7 @@ def dt_parse_iso(s: str, tz: Optional[str]) -> datetime:
 # Holidays: day-based matching
 # =========================
 
-def parse_holiday_days(holiday_list: List[Dict[str, Any]]) -> set:
+def parse_holiday_days(holiday_list: list[dict[str, Any]]) -> set:
     days = set()
     for h in holiday_list or []:
         dstr = h.get("date")
@@ -64,7 +68,10 @@ def is_holiday_day(shift_start_dt: datetime, holiday_days: set) -> bool:
 
 def get_feature_importance_dict(model, features):
     imp_gain = model.feature_importance(importance_type="gain")
-    return sorted([{"feature": f, "gain": float(g)} for f, g in zip(features, imp_gain)], key=lambda x: -x["gain"])
+    return sorted(
+        [{"feature": f, "gain": float(g)} for f, g in zip(features, imp_gain, strict=False)],
+        key=lambda x: -x["gain"]
+    )
 
 def parse_time_simple(tstr: str) -> time_cls:
     parts = list(map(int, tstr.split(":")))
@@ -72,7 +79,7 @@ def parse_time_simple(tstr: str) -> time_cls:
         return time_cls(parts[0], parts[1])
     return time_cls(parts[0], parts[1], parts[2])
 
-def to_date(obj) -> Optional[date_cls]:
+def to_date(obj) -> date_cls | None:
     if obj is None:
         return None
     if isinstance(obj, str):
@@ -93,7 +100,7 @@ def to_date(obj) -> Optional[date_cls]:
         return obj
     raise TypeError(f"Unsupported date type: {type(obj)}")
 
-def in_date_range(date_obj, start: Optional[str], end: Optional[str]) -> bool:
+def in_date_range(date_obj, start: str | None, end: str | None) -> bool:
     d = to_date(date_obj)
     if d is None:
         return True
@@ -120,17 +127,11 @@ def rolling_weeks_freq(weeks_sorted: list[int], current_week_idx: int, window: i
 # Hard constraints
 # =========================
 
-def user_qualified(user: Dict[str, Any], required_quals: List[int]) -> bool:
+def user_qualified(user: dict[str, Any], required_quals: list[int]) -> bool:
     uq = {q["id"] for q in user.get("qualifications", [])}
     return set(required_quals or []).issubset(uq)
 
-def user_active(user: Dict[str, Any], date_obj) -> bool:
-    return True
-
-def user_available_for_shift(user: Dict[str, Any], shift: Dict[str, Any], customer_tz: Optional[str]) -> bool:
-    return True
-
-def conflicts_with_parallel(shift: Dict[str, Any], user_id: str, assigned_by_user: Dict[str, List[int]], shift_index: Dict[int, Dict[str, Any]]) -> bool:
+def conflicts_with_parallel(shift: dict[str, Any], user_id: str, assigned_by_user: dict[str, list[int]], shift_index: dict[int, dict[str, Any]]) -> bool:
     for sid in assigned_by_user.get(user_id, []):
         other = shift_index.get(sid)
         if not other:
@@ -144,20 +145,23 @@ def conflicts_with_parallel(shift: Dict[str, Any], user_id: str, assigned_by_use
                 return True
     return False
 
-def conflicts_with_exceptions(shift: Dict[str, Any], user_id: str, all_assignments_by_user: Dict[str, List[Dict[str, Any]]]) -> bool:
+def negative_wish(shift: dict[str, Any], user_id: str) -> bool:
     return False
 
-def negative_wish(shift: Dict[str, Any], user_id: str) -> bool:
-    return False
-
-def positive_wishers(shift: Dict[str, Any]) -> List[str]:
+def positive_wishers(shift: dict[str, Any]) -> list[str]:
     return []
 
 # =========================
 # Adapters
 # =========================
 
-def adapt_past_plans_to_frames(data: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _extract_unit_tags(sh: dict[str, Any]) -> str:
+    tags = sh.get("unit_tags")
+    if tags is None:
+        return "UNTAGGED"
+    return str(tags)
+
+def adapt_past_plans_to_frames(data: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
     past_plans = data.get("past_shift_plans", []) or []
     default_tz = ((data.get("shift_plan") or {}).get("customer") or {}).get("zone_id")
 
@@ -176,7 +180,8 @@ def adapt_past_plans_to_frames(data: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.D
 
             shift_rows.append({
                 "id": sid,
-                "unit": str(sh.get("workplace_id")),
+                "unit_tags": _extract_unit_tags(sh),
+                "workplace_id": str(sh.get("workplace_id")),
                 "shiftType": str(sh.get("shift_card_id") or "GEN"),
                 "weekday": int(start_dt_local.weekday()),
                 "date": start_dt_local.date().isoformat(),
@@ -192,7 +197,7 @@ def adapt_past_plans_to_frames(data: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.D
     assignments_df = pd.DataFrame(asg_rows)
     return hist_shifts_df, assignments_df
 
-def adapt_target_plan_to_frames(data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[int, Dict[str, Any]], Dict[str, Dict[str, Any]], Optional[str]]:
+def adapt_target_plan_to_frames(data: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]], dict[str, dict[str, Any]], str | None]:
     sp = data["shift_plan"]
     customer_tz = (sp.get("customer") or {}).get("zone_id")
     holiday_days = parse_holiday_days(sp.get("public_holidays") or [])
@@ -213,7 +218,8 @@ def adapt_target_plan_to_frames(data: Dict[str, Any]) -> Tuple[List[Dict[str, An
         is_hol = is_holiday_day(start_dt_local, holiday_days)
         target_shifts.append({
             "id": sid,
-            "unit": str(sh.get("workplace_id")),
+            "unit_tags": _extract_unit_tags(sh),
+            "workplace_id": str(sh.get("workplace_id")),
             "shiftType": str(sh.get("shift_card_id") or "GEN"),
             "weekday": int(start_dt_local.weekday()),
             "date": start_dt_local.date().isoformat(),
@@ -241,13 +247,40 @@ def recency_weight(ts: datetime, now: datetime, lam=0.85, unit="week") -> float:
 def collect_history_stats(hist_shifts_df: pd.DataFrame,
                           assignments_df: pd.DataFrame,
                           users_df: pd.DataFrame,
-                          lam: float = 0.85) -> Dict[str, Dict[Tuple, Dict[str, float]]]:
+                          lam: float = 0.85) -> dict[str, dict[tuple, dict[str, float]]]:
+    """
+    Build recency-weighted stats by (userId, context), where context = (unit_tags, shiftType, weekday).
+    Ensures:
+      - unit_tags is present and treated as a stable string categorical.
+      - Merge uses matching columns.
+      - Weeks worked and holiday flags are computed consistently.
+    """
+    # Early exit if no history
     if hist_shifts_df.empty:
         return {}
+
+    # Ensure required columns exist
+    required_cols = ["id", "unit_tags", "shiftType", "weekday", "date", "isHoliday"]
+    missing = [c for c in required_cols if c not in hist_shifts_df.columns]
+    if missing:
+        raise ValueError(f"hist_shifts_df missing required columns for stats: {missing}")
+
+    # Normalize types
     df = hist_shifts_df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    now = df["date"].max()
-    now_dt = pd.to_datetime(now) if pd.notnull(now) else pd.Timestamp(datetime.utcnow())
+    # Keep unit_tags as provided (string categorical)
+    df["unit_tags"] = df["unit_tags"].astype(str)
+    df["shiftType"] = df["shiftType"].astype(str)
+    df["weekday"] = df["weekday"].astype(int)
+    # Parse date to Timestamp
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["isHoliday"] = df["isHoliday"].fillna(0).astype(int)
+
+    # Reference "now" for recency weighting
+    if df["date"].notna().any():
+        now = df["date"].max()
+    else:
+        now = pd.Timestamp(datetime.utcnow())
+    now_dt = pd.to_datetime(now)
 
     def _init():
         return {
@@ -261,37 +294,67 @@ def collect_history_stats(hist_shifts_df: pd.DataFrame,
 
     stats = defaultdict(lambda: defaultdict(_init))
 
-    df["context"] = df.apply(lambda r: (r["unit"], r["shiftType"], r["weekday"]), axis=1)
+    # Context key
+    df["context"] = df.apply(lambda r: (r["unit_tags"], r["shiftType"], r["weekday"]), axis=1)
     context_by_shift = dict(zip(df["id"], df["context"]))
 
+    # If no assignments, return empty stats (initialized)
     if assignments_df.empty:
         return stats
 
-    merged = assignments_df.merge(df[["id", "unit", "shiftType", "weekday", "date", "isHoliday"]],
-                                  left_on="shiftId", right_on="id", how="left")
-    merged["date"] = pd.to_datetime(merged["date"])
+    # Merge assignments with shift metadata
+    # Ensure assignments_df has expected columns
+    req_assign_cols = ["shiftId", "userId"]
+    miss_assign = [c for c in req_assign_cols if c not in assignments_df.columns]
+    if miss_assign:
+        raise ValueError(f"assignments_df missing required columns: {miss_assign}")
+
+    merged = assignments_df.merge(
+        df[["id", "unit_tags", "shiftType", "weekday", "date", "isHoliday"]],
+        left_on="shiftId", right_on="id", how="left"
+    )
+
+    # Iterate and accumulate stats
+    merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
 
     for _, row in merged.iterrows():
-        uid = row["userId"]
-        sid = row["shiftId"]
-        if sid not in context_by_shift:
+        uid = row.get("userId")
+        sid = row.get("shiftId")
+        if pd.isna(uid) or pd.isna(sid):
             continue
-        ctx = context_by_shift[sid]
-        date_dt = row["date"]
-        if pd.isnull(date_dt):
+        # Context lookup; skip if missing (e.g., assignment references unknown shift)
+        ctx = context_by_shift.get(sid)
+        if ctx is None:
             continue
-        w = recency_weight(date_dt, now_dt, lam=lam, unit="week")
+
+        date_dt = row.get("date")
+        if pd.isna(date_dt):
+            continue
+
+        # Recency weight
+        w = recency_weight(date_dt.to_pydatetime() if hasattr(date_dt, "to_pydatetime") else date_dt, now_dt, lam=lam, unit="week")
         sh_is_hol = int(row.get("isHoliday", 0)) == 1
+
         s = stats[uid][ctx]
 
+        # Count occurrences in context (one per assignment row)
         s["rw_num"] += w
         s["rw_denom"] += w
         s["count_assigned"] += 1
         s["count_occurrences"] += 1
-        s["last_assigned_days"] = min(s["last_assigned_days"], (now_dt - date_dt).days)
+        # Days since last assignment in context
+        try:
+            delta_days = (now_dt - pd.to_datetime(date_dt)).days
+        except Exception:
+            delta_days = 9999
+        s["last_assigned_days"] = min(s["last_assigned_days"], float(delta_days))
 
-        wk_idx = iso_week_index_from_date(date_dt.date())
-        s["weeks_worked"].append(wk_idx)
+        # Week index for periodic features
+        try:
+            wk_idx = iso_week_index_from_date(pd.to_datetime(date_dt).date())
+            s["weeks_worked"].append(wk_idx)
+        except Exception:
+            pass
 
         if sh_is_hol:
             s["rw_num_holiday"] += w
@@ -299,6 +362,7 @@ def collect_history_stats(hist_shifts_df: pd.DataFrame,
             s["count_assigned_holiday"] += 1
             s["count_occurrences_holiday"] += 1
 
+    # Finalize derived rates and periodic lists
     for uid, ctxs in stats.items():
         for ctx, s in ctxs.items():
             s["rw_assign_rate"] = (s["rw_num"] / max(s["rw_denom"], 1e-6))
@@ -306,14 +370,16 @@ def collect_history_stats(hist_shifts_df: pd.DataFrame,
                 s["rw_assign_rate_holiday"] = s["rw_num_holiday"] / max(s["rw_denom_holiday"], 1e-6)
             else:
                 s["rw_assign_rate_holiday"] = 0.0
+            # De-duplicate and sort weeks
             s["weeks_worked"] = sorted(set(s["weeks_worked"]))
 
     return stats
 
+
 def build_training_data(hist_shifts_df: pd.DataFrame,
                         assignments_df: pd.DataFrame,
                         users_df: pd.DataFrame,
-                        stats_by_user_ctx: Dict[str, Dict[Tuple, Dict[str, float]]],
+                        stats_by_user_ctx: dict[str, dict[tuple, dict[str, float]]],
                         k_neg_per_pos: int = 5) -> pd.DataFrame:
     if assignments_df.empty:
         raise ValueError("assignments_df is empty; need historical assignments to train.")
@@ -347,7 +413,7 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
         if sid not in shift_meta:
             continue
         sm = shift_meta[sid]
-        ctx = (sm["unit"], sm["shiftType"], sm["weekday"])
+        ctx = (sm["unit_tags"], sm["shiftType"], sm["weekday"])
         start_s = sm["start"]
         end_s = sm["end"]
         try:
@@ -376,7 +442,9 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
             pfeats = periodic_feats(uid, ctx, sm["date"])
             rows.append({
                 "shiftId": sid, "userId": uid, "y": 1,
-                "unit": sm["unit"], "shiftType": sm["shiftType"], "weekday": sm["weekday"],
+                "unit_tags": sm["unit_tags"],
+                "workplace_id": sm.get("workplace_id"),
+                "shiftType": sm["shiftType"], "weekday": sm["weekday"],
                 "hour": hour_val, "duration": duration_val, "isHoliday": int(sm.get("isHoliday", 0)),
                 "rw_assign_rate": sstats.get("rw_assign_rate", 0.0),
                 "count_assigned": sstats.get("count_assigned", 0),
@@ -394,7 +462,9 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
                 pfeats = periodic_feats(uid, ctx, sm["date"])
                 rows.append({
                     "shiftId": sid, "userId": uid, "y": 0,
-                    "unit": sm["unit"], "shiftType": sm["shiftType"], "weekday": sm["weekday"],
+                    "unit_tags": sm["unit_tags"],
+                    "workplace_id": sm.get("workplace_id"),
+                    "shiftType": sm["shiftType"], "weekday": sm["weekday"],
                     "hour": hour_val, "duration": duration_val, "isHoliday": int(sm.get("isHoliday", 0)),
                     "rw_assign_rate": sstats.get("rw_assign_rate", 0.0),
                     "count_assigned": sstats.get("count_assigned", 0),
@@ -406,23 +476,24 @@ def build_training_data(hist_shifts_df: pd.DataFrame,
     df = pd.DataFrame(rows)
     if df.empty:
         raise ValueError("Training data ended up empty. Check past_shift_plans.shift_assignments and ids.")
-    df["unit"] = df["unit"].astype("category")
+    df["unit_tags"] = df["unit_tags"].astype("category")
     df["shiftType"] = df["shiftType"].astype("category")
+    df["workplace_id"] = df["workplace_id"].astype("category")
     return df
 
 # =========================
 # Model training
 # =========================
 
-def train_and_calibrate_with_val(df: pd.DataFrame) -> Tuple[Any, Any, List[str], Tuple[pd.DataFrame, pd.Series]]:
+def train_and_calibrate_with_val(df: pd.DataFrame) -> tuple[Any, Any, list[str], tuple[pd.DataFrame, pd.Series]]:
     features = [
-        "unit", "shiftType", "weekday", "hour", "duration", "isHoliday",
+        "unit_tags", "workplace_id", "shiftType", "weekday", "hour", "duration", "isHoliday",
         "rw_assign_rate", "count_assigned", "last_assigned_days", "userFTE",
         "weeks_since_last_ctx_wd", "worked_last_1w_ctx_wd", "worked_last_2w_ctx_wd", "freq_ctx_wd_8w"
     ]
     X = df[features]
     y = df["y"]
-    cat_features = ["unit", "shiftType"]
+    cat_features = ["unit_tags", "workplace_id", "shiftType"]
 
     X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
     lgb_train = lgb.Dataset(X_tr, label=y_tr, categorical_feature=cat_features, free_raw_data=False)
@@ -451,12 +522,12 @@ def train_and_calibrate_with_val(df: pd.DataFrame) -> Tuple[Any, Any, List[str],
 # Scoring and assignment
 # =========================
 
-def score_candidates_for_shift(shift: Dict[str, Any],
-                               candidate_ids: List[str],
-                               users_by_id: Dict[str, Dict[str, Any]],
-                               stats_by_user_ctx: Dict[str, Dict[Tuple, Dict[str, float]]],
-                               model, iso_calibrator, features: List[str]) -> List[Tuple[str, float]]:
-    ctx = (shift["unit"], shift["shiftType"], shift["weekday"])
+def score_candidates_for_shift(shift: dict[str, Any],
+                               candidate_ids: list[str],
+                               users_by_id: dict[str, dict[str, Any]],
+                               stats_by_user_ctx: dict[str, dict[tuple, dict[str, float]]],
+                               model, iso_calibrator, features: list[str]) -> list[tuple[str, float]]:
+    ctx = (shift["unit_tags"], shift["shiftType"], shift["weekday"])
     try:
         hour = int(str(shift["start"])[:2])
     except Exception:
@@ -493,7 +564,8 @@ def score_candidates_for_shift(shift: Dict[str, Any],
         urec = users_by_id.get(uid, {})
         pfeats = periodic_feats_infer(uid, ctx, cur_date_str)
         rows.append({
-            "unit": shift["unit"], "shiftType": shift["shiftType"], "weekday": shift["weekday"],
+            "unit_tags": shift["unit_tags"], "workplace_id": shift.get("workplace_id"),
+            "shiftType": shift["shiftType"], "weekday": shift["weekday"],
             "hour": hour, "duration": duration, "isHoliday": isHoliday,
             "rw_assign_rate": s.get("rw_assign_rate", 0.0),
             "count_assigned": s.get("count_assigned", 0),
@@ -505,27 +577,28 @@ def score_candidates_for_shift(shift: Dict[str, Any],
     if not rows:
         return []
     X = pd.DataFrame(rows)
-    X["unit"] = X["unit"].astype("category")
+    X["unit_tags"] = X["unit_tags"].astype("category")
     X["shiftType"] = X["shiftType"].astype("category")
+    X["workplace_id"] = X["workplace_id"].astype("category")
     p_raw = model.predict(X[features])
     p = iso_calibrator.predict(p_raw)
     return list(zip(idx, p))
 
 def assign_target_period(
-    target_shifts: List[Dict[str, Any]],
-    users_by_id: Dict[str, Dict[str, Any]],
-    shift_index: Dict[int, Dict[str, Any]],
+    target_shifts: list[dict[str, Any]],
+    users_by_id: dict[str, dict[str, Any]],
+    shift_index: dict[int, dict[str, Any]],
     model, iso_calibrator, features,
-    stats_by_user_ctx: Dict[str, Dict[Tuple, Dict[str, float]]],
-    fairness_weekly_soft_cap_hours: Optional[float] = None,
-    fairness_opt_out_hard_cap_delta_hours: Optional[float] = None,
-    customer_tz: Optional[str] = None,
+    stats_by_user_ctx: dict[str, dict[tuple, dict[str, float]]],
+    fairness_weekly_soft_cap_hours: float | None = None,
+    fairness_opt_out_hard_cap_delta_hours: float | None = None,
+    customer_tz: str | None = None,
     top_k: int = 5
-) -> Tuple[Dict[int, str], Dict[str, Any]]:
-    assigned_by_user: Dict[str, List[int]] = defaultdict(list)
-    assigned_hours_by_user_global: Dict[str, float] = defaultdict(float)
-    assigned_hours_by_user_week: Dict[Tuple[str, str], float] = defaultdict(float)
-    all_assignments_by_user: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+) -> tuple[dict[int, str], dict[str, Any]]:
+    assigned_by_user: dict[str, list[int]] = defaultdict(list)
+    assigned_hours_by_user_global: dict[str, float] = defaultdict(float)
+    assigned_hours_by_user_week: dict[tuple[str, str], float] = defaultdict(float)
+    all_assignments_by_user: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
     result = {}
     report = {
@@ -544,7 +617,7 @@ def assign_target_period(
         y, w, _ = d.isocalendar()
         return f"{y}-W{w:02d}"
 
-    def fairness_penalty(new_hours: float, soft_cap: Optional[float], hard_cap: Optional[float]) -> float:
+    def fairness_penalty(new_hours: float, soft_cap: float | None, hard_cap: float | None) -> float:
         if soft_cap is None or soft_cap <= 0:
             return 0.0
         if new_hours <= soft_cap:
@@ -562,14 +635,14 @@ def assign_target_period(
     for s in target_shifts:
         sid = s["id"]
 
-        # Preserve preplanned assignments
         preplanned_user = s.get("preplannedUserId")
         if preplanned_user:
             result[sid] = preplanned_user
             report["shifts"].append({
                 "shiftId": sid,
                 "meta": {
-                    "unit": s["unit"], "shiftType": s["shiftType"], "weekday": s["weekday"],
+                    "unit_tags": s["unit_tags"], "workplace_id": s.get("workplace_id"),
+                    "shiftType": s["shiftType"], "weekday": s["weekday"],
                     "date": s["date"], "start": s["start"], "end": s["end"],
                     "requiredQualifications": s.get("requiredQualifications", []),
                     "isHoliday": int(s.get("isHoliday", 0))
@@ -597,7 +670,8 @@ def assign_target_period(
         explanation = {
             "shiftId": sid,
             "meta": {
-                "unit": s["unit"], "shiftType": s["shiftType"], "weekday": s["weekday"],
+                "unit_tags": s["unit_tags"], "workplace_id": s.get("workplace_id"),
+                "shiftType": s["shiftType"], "weekday": s["weekday"],
                 "date": s["date"], "start": s["start"], "end": s["end"],
                 "requiredQualifications": s.get("requiredQualifications", []),
                 "isHoliday": int(s.get("isHoliday", 0))
@@ -623,8 +697,9 @@ def assign_target_period(
             user = users_by_id[uid]
             if not user_qualified(user, s.get("requiredQualifications", [])):
                 reasons.append("not_qualified")
-            if not user_available_for_shift(user, s, customer_tz):
-                reasons.append("not_available")
+            # Availability hook, if you have data:
+            # if not user_available_for_shift(user, s, customer_tz):
+            #     reasons.append("not_available")
             if conflicts_with_parallel(s, uid, assigned_by_user, shift_index):
                 reasons.append("parallel_conflict")
             if negative_wish(s, uid):
@@ -643,7 +718,7 @@ def assign_target_period(
             unconstrained_ranked = score_candidates_for_shift(
                 s, unconstrained_candidates, users_by_id, stats_by_user_ctx, model, iso_calibrator, features
             )
-            ctx = (s["unit"], s["shiftType"], s["weekday"])
+            ctx = (s["unit_tags"], s["shiftType"], s["weekday"])
             stats_for_uid_uc = {uid: (stats_by_user_ctx.get(uid, {}) or {}).get(ctx, {}) for uid, _ in unconstrained_ranked}
 
             beta1, beta2, beta3 = 0.10, 0.05, 0.05
@@ -708,7 +783,7 @@ def assign_target_period(
             report["shifts"].append(explanation)
             continue
 
-        ctx = (s["unit"], s["shiftType"], s["weekday"])
+        ctx = (s["unit_tags"], s["shiftType"], s["weekday"])
         stats_for_uid = {uid: (stats_by_user_ctx.get(uid, {}) or {}).get(ctx, {}) for uid, _ in ranked}
 
         top_list_report = sorted(ranked, key=lambda t: t[1], reverse=True)[:top_k]
@@ -753,7 +828,7 @@ def assign_target_period(
             hrs = 8.0
         wk = week_key_from_date_str(s["date"])
 
-        scored: List[Tuple[str, float, float, float, float]] = []
+        scored: list[tuple[str, float, float, float, float]] = []
         fairness_skips_hardcap = []
 
         for uid, p in ranked:
@@ -855,7 +930,6 @@ def assign_target_period(
         }
     return result, report
 
-
 # =========================
 # Build output
 # =========================
@@ -878,17 +952,14 @@ def build_assigned_output(report: dict) -> dict:
         })
     return {"shifts": shifts}
 
-
-import os
-
 def assign_top_candidates_to_shifts(base_json_path: str,
                                     model_output_path: str,
                                     out_json_path: str,
                                     source_label: str = "ML_MODEL"):
 
-    with open(base_json_path, "r", encoding="utf-8") as f:
+    with open(base_json_path, encoding="utf-8") as f:
         base = json.load(f)
-    with open(model_output_path, "r", encoding="utf-8") as f:
+    with open(model_output_path, encoding="utf-8") as f:
         model = json.load(f)
 
     sp = base.get("shift_plan", {}) or {}
@@ -916,7 +987,7 @@ def assign_top_candidates_to_shifts(base_json_path: str,
         except (TypeError, ValueError):
             continue
 
-        candidates = entry.get("candidates") or []
+        candidates = entry.get("constrainedCandidates") or entry.get("candidates") or []
         if not candidates:
             continue
 

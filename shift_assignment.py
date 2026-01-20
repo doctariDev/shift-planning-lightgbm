@@ -1,21 +1,21 @@
 import json
+
 import pandas as pd
 
 from utils import (
-    adapt_target_plan_to_frames,
     adapt_past_plans_to_frames,
-    build_assigned_output,
-    collect_history_stats,
-    build_training_data,
-    train_and_calibrate_with_val,
+    adapt_target_plan_to_frames,
     assign_target_period,
+    build_assigned_output,
+    build_training_data,
+    collect_history_stats,
     get_feature_importance_dict,
+    train_and_calibrate_with_val,
 )
 from visualize_output_plan import ensure_dir
 
 
 def build_assignment_output(report: dict) -> dict:
-
     assigned = []
     for s in report.get("shifts", []):
         chosen = (s.get("chosen") or {}).get("userId")
@@ -36,14 +36,17 @@ def build_assignment_output(report: dict) -> dict:
 
 def run_pipeline(
     planning_request_complete_path: str,
-    output_dir: str = "output",
+    output_dir: str = "output/output_job.json",
 ):
-    with open(planning_request_complete_path, "r", encoding="utf-8") as f:
+    with open(planning_request_complete_path, encoding="utf-8") as f:
         data = json.load(f)
 
     hist_shifts_df, assignments_df = adapt_past_plans_to_frames(data)
     if hist_shifts_df.empty or assignments_df.empty:
-        raise ValueError("No historical data found. Ensure past_shift_plans contain shifts and shift_assignments.")
+        raise ValueError(
+            "No historical data found. Ensure past_shift_plans contain "
+            "shifts and shift_assignments."
+        )
 
     target_shifts, shift_index, users_by_id, customer_tz = adapt_target_plan_to_frames(data)
     if not target_shifts:
@@ -52,7 +55,9 @@ def run_pipeline(
     users_df = pd.DataFrame(list(users_by_id.values()))
 
     stats_by_user_ctx = collect_history_stats(hist_shifts_df, assignments_df, users_df, lam=0.85)
-    train_df = build_training_data(hist_shifts_df, assignments_df, users_df, stats_by_user_ctx, k_neg_per_pos=5)
+    train_df = build_training_data(
+        hist_shifts_df, assignments_df, users_df, stats_by_user_ctx, k_neg_per_pos=5
+    )
     model, iso_cal, feats, (X_val, y_val) = train_and_calibrate_with_val(train_df)
 
     result, report = assign_target_period(
@@ -66,8 +71,14 @@ def run_pipeline(
 
     print("Hist shifts:", hist_shifts_df.shape, "Assignments:", assignments_df.shape)
     print("Distinct shiftIds with assignments:", assignments_df["shiftId"].nunique())
-    print("Missing shiftIds in history:", len(set(assignments_df["shiftId"]) - set(hist_shifts_df["id"])))
-    print(hist_shifts_df[["unit", "shiftType", "weekday"]].drop_duplicates().shape)
+    missing_shift_ids = len(set(assignments_df["shiftId"]) - set(hist_shifts_df["id"]))
+    print("Missing shiftIds in history:", missing_shift_ids)
+    cols_to_check = ["unit_tags", "workplace_id", "shiftType", "weekday"]
+    existing_cols = [c for c in cols_to_check if c in hist_shifts_df.columns]
+    if existing_cols:
+        print("Distinct contexts (history):", hist_shifts_df[existing_cols].drop_duplicates().shape)
+    else:
+        print("Warning: expected columns not found in hist_shifts_df:", cols_to_check)
 
     target_shift_ids = {int(s["id"]) for s in data["shift_plan"].get("shifts", [])}
     existing = data["shift_plan"].get("shift_assignments") or []
@@ -83,6 +94,6 @@ def run_pipeline(
     ensure_dir("output")
     with open(output_dir, "w", encoding="utf-8") as f:
         json.dump(compact, f, indent=2, ensure_ascii=False)
-    print("Wrote output with scores to: output/output_job.json")
+    print(f"Wrote output with scores to: {output_dir}")
 
     return data
