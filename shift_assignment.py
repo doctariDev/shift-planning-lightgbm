@@ -1,99 +1,157 @@
 import json
-
 import pandas as pd
-
 from utils import (
     adapt_past_plans_to_frames,
     adapt_target_plan_to_frames,
-    assign_target_period,
-    build_assigned_output,
     build_training_data,
+    calibrate_isotonic,
     collect_history_stats,
-    get_feature_importance_dict,
-    train_and_calibrate_with_val,
+    train_lgb_full,
+    save_model_bundle,
+    load_model_bundle,
+    continue_training as utils_continue_training,
+    recalibrate,
+    assign_target_period,
 )
 from visualize_output_plan import ensure_dir
 
-
-def build_assignment_output(report: dict) -> dict:
-    assigned = []
-    for s in report.get("shifts", []):
-        chosen = (s.get("chosen") or {}).get("userId")
-        if not chosen:
-            continue
-        cands = s.get("candidatesAfterFinalScoreOnly") or []
-        cands = [
-            {"userId": c["userId"], "final_score": float(c.get("final_score", 0.0))}
-            for c in cands
-        ]
-        cands.sort(key=lambda d: d["final_score"], reverse=True)
-        assigned.append({
-            "shiftId": int(s.get("shiftId")),
-            "candidates": cands
-        })
-    return {"shifts": assigned}
-
-
-def run_pipeline(
+def train_model(
     planning_request_complete_path: str,
-    output_dir: str = "output/output_job.json",
+    from_scratch: bool = True,
+    recency_weighting: float = 0.85,
+    model_bundle_dir: str | None = None,
+    num_additional_rounds: int = 200,
+    save_updated_bundle: bool = True,
 ):
+    """
+    Train a model either from scratch or continue training from an existing bundle.
+
+    Returns:
+      model, iso_calibrator, features, stats_by_user_ctx
+    """
     with open(planning_request_complete_path, encoding="utf-8") as f:
         data = json.load(f)
 
     hist_shifts_df, assignments_df = adapt_past_plans_to_frames(data)
     if hist_shifts_df.empty or assignments_df.empty:
         raise ValueError(
-            "No historical data found. Ensure past_shift_plans contain "
-            "shifts and shift_assignments."
+            "No historical data found. Ensure past_shift_plans contain shifts and shift_assignments."
         )
 
-    target_shifts, shift_index, users_by_id, customer_tz = adapt_target_plan_to_frames(data)
+    target_shifts, _, users_by_id, _ = adapt_target_plan_to_frames(data)
     if not target_shifts:
         raise ValueError("No target shifts found in shift_plan.shifts.")
 
     users_df = pd.DataFrame(list(users_by_id.values()))
-
-    stats_by_user_ctx = collect_history_stats(hist_shifts_df, assignments_df, users_df, lam=0.85)
+    stats_by_user_ctx = collect_history_stats(
+        hist_shifts_df, assignments_df, users_df, lam=recency_weighting
+    )
     train_df = build_training_data(
         hist_shifts_df, assignments_df, users_df, stats_by_user_ctx, k_neg_per_pos=5
     )
-    model, iso_cal, feats, (X_val, y_val) = train_and_calibrate_with_val(train_df)
 
-    result, report = assign_target_period(
-        target_shifts, users_by_id, shift_index,
-        model, iso_cal, feats, stats_by_user_ctx,
+    if from_scratch:
+        model, feats, (X_val, y_val) = train_lgb_full(train_df)
+        iso_cal, _ = calibrate_isotonic(model, X_val, y_val)
+
+        if save_updated_bundle:
+            save_model_bundle(model, iso_cal, feats, save_dir=model_bundle_dir or "model_bundle")
+
+        return model, iso_cal, feats, stats_by_user_ctx
+
+    if not model_bundle_dir:
+        model_bundle_dir = "model_bundle"
+    
+    model, iso_cal, feats = load_model_bundle(save_dir=model_bundle_dir)
+
+    cat_cols = feats if feats else ["unit_tags", "workplace_id", "shiftType"]
+    for c in cat_cols:
+        if train_df[c].dtype.name != "category":
+            train_df[c] = train_df[c].astype("category")
+
+    model = utils_continue_training(
+        booster=model,
+        df=train_df,
+        num_additional_rounds=num_additional_rounds,
+    )
+    iso_cal = recalibrate(model, train_df)
+
+    if save_updated_bundle:
+        save_model_bundle(model, iso_cal, feats, save_dir=model_bundle_dir)
+
+    return model, iso_cal, feats, stats_by_user_ctx
+
+
+def evaluate_model(
+    model,
+    iso_cal,
+    feats,
+    stats_by_user_ctx,
+    planning_request_complete_path: str,
+    output_dir: str = "output/eval_output_job.json",
+):
+    """
+    Evaluates the model using assign_target_period (supporting constrained and unconstrained scoring).
+    - Generates results for shifts with constrained and unconstrained scores.
+    - Writes compact JSON output.
+    """
+    with open(planning_request_complete_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    target_shifts, shift_index, users_by_id, customer_tz = adapt_target_plan_to_frames(data)
+
+    _, report = assign_target_period(
+        target_shifts=target_shifts,
+        users_by_id=users_by_id,
+        shift_index=shift_index,
+        model=model,
+        iso_calibrator=iso_cal,
+        features=feats,
+        stats_by_user_ctx=stats_by_user_ctx,
         customer_tz=customer_tz,
         top_k=5
     )
 
-    report["modelSummary"] = {"featureImportance": get_feature_importance_dict(model, feats)}
+    print("Test")
 
-    print("Hist shifts:", hist_shifts_df.shape, "Assignments:", assignments_df.shape)
-    print("Distinct shiftIds with assignments:", assignments_df["shiftId"].nunique())
-    missing_shift_ids = len(set(assignments_df["shiftId"]) - set(hist_shifts_df["id"]))
-    print("Missing shiftIds in history:", missing_shift_ids)
-    cols_to_check = ["unit_tags", "workplace_id", "shiftType", "weekday"]
-    existing_cols = [c for c in cols_to_check if c in hist_shifts_df.columns]
-    if existing_cols:
-        print("Distinct contexts (history):", hist_shifts_df[existing_cols].drop_duplicates().shape)
-    else:
-        print("Warning: expected columns not found in hist_shifts_df:", cols_to_check)
+    results = report["shifts"]
 
-    target_shift_ids = {int(s["id"]) for s in data["shift_plan"].get("shifts", [])}
-    existing = data["shift_plan"].get("shift_assignments") or []
-    kept = [a for a in existing if int(a["shift_id"]) not in target_shift_ids]
-    for sid, uid in result.items():
-        kept.append({"shift_id": int(sid), "employee_uuid": uid, "source": "MODEL"})
-    data["shift_plan"]["shift_assignments"] = kept
+    compact = {"shifts": []}
 
-    data["assignmentReport"] = report
+    for shift in results:
+        shift_id = shift["shiftId"]
 
-    compact = build_assigned_output(report)
+        constrained_candidates = shift.get("candidatesAfterFinalScoreOnly", [])
+        unconstrained_candidates = shift.get("unconstrainedCandidatesAfterFinalScoreOnly", [])
+
+        compact["shifts"].append({
+            "shiftId": shift_id,
+            "constrainedCandidates": constrained_candidates,
+            "unconstrainedCandidates": unconstrained_candidates
+        })
+
 
     ensure_dir("output")
     with open(output_dir, "w", encoding="utf-8") as f:
         json.dump(compact, f, indent=2, ensure_ascii=False)
     print(f"Wrote output with scores to: {output_dir}")
 
-    return data
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="Path to planning_request_complete JSON")
+    parser.add_argument("--from_scratch", action="store_true", help="Train from scratch")
+    parser.add_argument("--bundle_dir", default="model_bundle", help="Model bundle directory")
+    parser.add_argument("--rounds", type=int, default=200, help="Additional rounds when continuing")
+    parser.add_argument("--no_save", action="store_true", help="Do not save updated bundle")
+    args = parser.parse_args()
+
+    model, iso, feats, stats = train_model(
+        planning_request_complete_path=args.input,
+        from_scratch=args.from_scratch,
+        model_bundle_dir=args.bundle_dir,
+        num_additional_rounds=args.rounds,
+        save_updated_bundle=not args.no_save
+    )
+    print("Training finished. Features:", feats)
