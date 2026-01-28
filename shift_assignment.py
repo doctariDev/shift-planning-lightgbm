@@ -11,7 +11,7 @@ from utils import (
     load_model_bundle,
     continue_training as utils_continue_training,
     recalibrate,
-    assign_target_period,
+    calculate_assignment_scores,
 )
 from visualize_output_plan import ensure_dir
 
@@ -23,12 +23,6 @@ def train_model(
     num_additional_rounds: int = 200,
     save_updated_bundle: bool = True,
 ):
-    """
-    Train a model either from scratch or continue training from an existing bundle.
-
-    Returns:
-      model, iso_calibrator, features, stats_by_user_ctx
-    """
     with open(planning_request_complete_path, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -98,7 +92,7 @@ def evaluate_model(
 
     stats_by_user_ctx = collect_history_stats(hist_shifts_df, assignments_df)
 
-    scores = assign_target_period(
+    scores = calculate_assignment_scores(
         target_shifts=target_shifts,
         users_by_id=users_by_id,
         shift_index=shift_index,

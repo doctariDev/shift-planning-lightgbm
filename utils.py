@@ -541,7 +541,7 @@ def score_candidates_for_shift(shift: Dict[str, Any],
     p = iso_calibrator.predict(p_raw)
     return list(zip(idx, p))
 
-def assign_target_period(
+def calculate_assignment_scores(
     target_shifts: List[Dict[str, Any]],
     users_by_id: Dict[str, Dict[str, Any]],
     shift_index: Dict[int, Dict[str, Any]],
